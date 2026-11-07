@@ -88,6 +88,11 @@ type private WorkerProc(cwd: string, log: TextWriter, env: (string * string) lis
             p.WaitForExit(5000) |> ignore // release file handles before the snapshot is deleted
         with _ -> ()
 
+/// What a tool call returns: the text, the error flag, and optionally machine-readable `structuredContent`.
+type private ToolOutput = { Text: string; IsError: bool; Structured: obj option }
+
+let private plain (text: string, isError: bool) = { Text = text; IsError = isError; Structured = None }
+
 type private Front(log: TextWriter) =
     let cwd = Environment.CurrentDirectory
     let mutable loaded: Resolved option = None
@@ -156,10 +161,10 @@ type private Front(log: TextWriter) =
         snapshotDir |> Option.iter Snapshot.delete
 
     member _.Eval(code: string, timeoutSeconds: int, ct) =
-        request {| op = "eval"; code = code |} (TimeSpan.FromSeconds(float timeoutSeconds)) ct
+        request {| op = "eval"; code = code |} (TimeSpan.FromSeconds(float timeoutSeconds)) ct |> plain
 
     member _.Typecheck(code: string, ct) =
-        request {| op = "typecheck"; code = code |} (TimeSpan.FromSeconds 120.) ct
+        request {| op = "typecheck"; code = code |} (TimeSpan.FromSeconds 120.) ct |> plain
 
     member _.Reset(newPrelude: string option) =
         newPrelude |> Option.iter (fun p -> prelude <- (if p = "" then None else Some(Path.GetFullPath p)))
@@ -169,8 +174,8 @@ type private Front(log: TextWriter) =
                 match loaded with
                 | Some r -> $", referencing {Path.GetFileName r.ProjectFile} ({r.Managed.Length} assemblies, not rebuilt)"
                 | None -> ""
-            $"Fresh session ({t}{refs}).", false
-        | Error e -> e, true
+            plain ($"Fresh session ({t}{refs}).", false)
+        | Error e -> plain (e, true)
 
     member _.LoadProject(path: string, build: bool, configuration: string, newPrelude: string option, newGcServer: bool option, newArtifactsPath: string option, newEnv: (string * string) list option) =
         newPrelude |> Option.iter (fun p -> prelude <- (if p = "" then None else Some(Path.GetFullPath p)))
@@ -179,9 +184,10 @@ type private Front(log: TextWriter) =
         newEnv |> Option.iter (fun e -> extraEnv <- e)
         let sw = Stopwatch.StartNew()
         match findProjectFile path |> Result.bind (fun p -> resolveProject p build configuration artifactsPath) with
-        | Error e -> e, true // keep the current session alive
+        | Error e -> plain (e, true) // keep the current session alive
         | Ok r ->
             let resolveSecs = sw.Elapsed.TotalSeconds
+            let stableRefs = r.Managed // before the snapshot swap: these paths outlive the next load
             let dir, copies = Snapshot.create r.Built
             let swap p = Map.tryFind p copies |> Option.defaultValue p
             loaded <- Some { r with Managed = r.Managed |> List.map swap }
@@ -190,7 +196,7 @@ type private Front(log: TextWriter) =
             let started = spawn () // kills the previous worker first
             previous |> Option.iter Snapshot.delete
             match started with
-            | Error e -> $"Resolved {r.Managed.Length} assemblies but the session failed to start:\n{e}", true
+            | Error e -> plain ($"Resolved {r.Managed.Length} assemblies but the session failed to start:\n{e}", true)
             | Ok t ->
                 let surface = publicSurface r.TargetPath
                 let sb = StringBuilder()
@@ -212,14 +218,16 @@ type private Front(log: TextWriter) =
                     line $"Public top-level types/modules in {Path.GetFileName r.TargetPath} ({surface.Length}):"
                     sb.Append(clip 3000 (String.Join("\n", surface))) |> ignore
                 lastSurface <- Some(r.ProjectFile, surface)
-                sb.ToString().TrimEnd(), false
+                { Text = sb.ToString().TrimEnd()
+                  IsError = false
+                  Structured = Some(box {| references = Array.ofList stableRefs; targetPath = r.TargetPath |}) }
 
-    member _.Bindings(ct) = request {| op = "bindings" |} (TimeSpan.FromSeconds 60.) ct
+    member _.Bindings(ct) = request {| op = "bindings" |} (TimeSpan.FromSeconds 60.) ct |> plain
 
     /// Evaluate `code` while the server records the worker; append a CPU or allocation profile.
     member _.Profile(code: string, mode: Profiler.Mode, top: int, timeoutSeconds: int, ct) =
         match ensure () with
-        | Error e -> $"Could not start the F# session: {e}", true
+        | Error e -> plain ($"Could not start the F# session: {e}", true)
         | Ok w ->
             let attempt =
                 try
@@ -227,13 +235,13 @@ type private Front(log: TextWriter) =
                 with e ->
                     Error $"Could not attach the profiler to the worker (pid {w.Pid}): {e.Message}"
             match attempt with
-            | Error e -> e, true
+            | Error e -> plain (e, true)
             | Ok((text, isError), trace) ->
                 let report =
                     try Profiler.analyze mode trace top
                     with e -> $"(could not analyse the trace: {e.Message})"
                 let label = match mode with Profiler.Cpu -> "cpu" | Profiler.Alloc -> "alloc"
-                $"{text}\n\n--- profile ({label}) ---\n{report}", isError
+                plain ($"{text}\n\n--- profile ({label}) ---\n{report}", isError)
 
 let private toolsJson =
     JsonDocument.Parse(
@@ -338,7 +346,7 @@ let run () =
         | "profile" ->
             let mode = match str a "mode" with "alloc" -> Profiler.Alloc | _ -> Profiler.Cpu
             front.Profile(str a "code", mode, argInt a "top" 15, argInt a "timeout_seconds" 120, ct)
-        | other -> $"Unknown tool: {other}", true
+        | other -> plain ($"Unknown tool: {other}", true)
 
     let handle (line: string) =
         use doc = JsonDocument.Parse line
@@ -377,17 +385,20 @@ let run () =
                 | _ -> emptyObject
             serialized (fun () ->
                 let sw = Stopwatch.StartNew()
-                let text, isError =
+                let out =
                     try
                         callTool name args cts.Token
                     with e ->
-                        $"internal error: {e}", true
+                        plain ($"internal error: {e}", true)
                 inflight.TryRemove key |> ignore
-                log.WriteLine($"[fsi-mcp] {name} {sw.ElapsedMilliseconds} ms isError={isError}")
+                log.WriteLine($"[fsi-mcp] {name} {sw.ElapsedMilliseconds} ms isError={out.IsError}")
                 send
                     {| jsonrpc = "2.0"
                        id = id
-                       result = {| content = [| {| ``type`` = "text"; text = text |} |]; isError = isError |} |})
+                       result =
+                        match out.Structured with
+                        | Some sc -> box {| content = [| {| ``type`` = "text"; text = out.Text |} |]; isError = out.IsError; structuredContent = sc |}
+                        | None -> box {| content = [| {| ``type`` = "text"; text = out.Text |} |]; isError = out.IsError |} |})
         | "notifications/cancelled", None ->
             match prms.TryGetProperty "requestId" with
             | true, rid ->

@@ -16,7 +16,7 @@ let private metadata key =
 let serverDll = metadata "ServerDll"
 let fixturesDir = metadata "FixturesDir"
 
-type ToolResult = { Text: string; IsError: bool }
+type ToolResult = { Text: string; IsError: bool; Structured: JsonElement option }
 
 type Server(?cwd: string) =
     let stderr = StringBuilder()
@@ -71,7 +71,11 @@ type Server(?cwd: string) =
     member this.Call(tool: string, args: obj) : ToolResult =
         let r = this.Request("tools/call", {| name = tool; arguments = args |})
         { Text = r.GetProperty("content").Item(0).GetProperty("text").GetString()
-          IsError = r.GetProperty("isError").GetBoolean() }
+          IsError = r.GetProperty("isError").GetBoolean()
+          Structured =
+            match r.TryGetProperty "structuredContent" with
+            | true, v -> Some v
+            | _ -> None }
 
     member this.Eval(code: string) = this.Call("eval", {| code = code |})
     member this.Eval(code: string, timeoutSeconds: int) = this.Call("eval", {| code = code; timeout_seconds = timeoutSeconds |})

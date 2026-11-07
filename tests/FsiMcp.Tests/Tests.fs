@@ -233,3 +233,14 @@ let ``artifacts_path keeps build output out of the project folder`` () =
     Assert.False(Directory.Exists(Path.Combine(dir, "obj")), "obj/ under the project")
     Assert.True(Directory.Exists(Path.Combine(artifacts, "bin")))
     s.Eval "SampleLib.Lib.version" |> ok |> has "val it: int = 1"
+
+[<Fact>]
+let ``load_project returns its references as structured content`` () =
+    let dir = copyFixture "SampleLib"
+    use s = start ()
+    let r = s.LoadProject dir |> ok
+    let refs = [ for e in r.Structured.Value.GetProperty("references").EnumerateArray() -> e.GetString() ]
+    Assert.Contains(refs, fun p -> p.EndsWith "Newtonsoft.Json.dll")
+    Assert.Contains(refs, fun p -> p.EndsWith "SampleLib.dll")
+    Assert.All(refs, fun p -> Assert.True(File.Exists p, p))
+    Assert.DoesNotContain(refs, fun p -> p.Contains(Path.Combine(Path.GetTempPath(), "fsi-mcp") + string Path.DirectorySeparatorChar))
