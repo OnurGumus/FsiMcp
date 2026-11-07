@@ -1,5 +1,6 @@
 module FsiMcp.Tests.Tests
 
+open System
 open System.IO
 open Xunit
 open FsiMcp.Tests.McpClient
@@ -221,3 +222,14 @@ let ``the module list repeats only when it changes`` () =
     use s = start ()
     s.LoadProject dir |> ok |> has "SampleLib.Lib"
     s.LoadProject dir |> ok |> has "unchanged (1)"
+
+[<Fact>]
+let ``artifacts_path keeps build output out of the project folder`` () =
+    let dir = copyFixture "SampleLib"
+    let artifacts = Path.Combine(Path.GetTempPath(), "fsi-mcp-tests", Guid.NewGuid().ToString("N"), "artifacts")
+    use s = start ()
+    s.Call("load_project", {| path = dir; artifacts_path = artifacts |}) |> ok |> ignore
+    Assert.False(Directory.Exists(Path.Combine(dir, "bin")), "bin/ under the project")
+    Assert.False(Directory.Exists(Path.Combine(dir, "obj")), "obj/ under the project")
+    Assert.True(Directory.Exists(Path.Combine(artifacts, "bin")))
+    s.Eval "SampleLib.Lib.version" |> ok |> has "val it: int = 1"

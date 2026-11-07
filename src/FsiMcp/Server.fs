@@ -96,6 +96,7 @@ type private Front(log: TextWriter) =
     // Remembered across load_project / reset / timeout restarts until changed.
     let mutable prelude: string option = None
     let mutable gcServer = false
+    let mutable artifactsPath: string option = None
     let mutable extraEnv: (string * string) list = []
     let mutable lastSurface: (string * string list) option = None
 
@@ -171,12 +172,13 @@ type private Front(log: TextWriter) =
             $"Fresh session ({t}{refs}).", false
         | Error e -> e, true
 
-    member _.LoadProject(path: string, build: bool, configuration: string, newPrelude: string option, newGcServer: bool option, newEnv: (string * string) list option) =
+    member _.LoadProject(path: string, build: bool, configuration: string, newPrelude: string option, newGcServer: bool option, newArtifactsPath: string option, newEnv: (string * string) list option) =
         newPrelude |> Option.iter (fun p -> prelude <- (if p = "" then None else Some(Path.GetFullPath p)))
         newGcServer |> Option.iter (fun g -> gcServer <- g)
+        newArtifactsPath |> Option.iter (fun p -> artifactsPath <- (if p = "" then None else Some(Path.GetFullPath p)))
         newEnv |> Option.iter (fun e -> extraEnv <- e)
         let sw = Stopwatch.StartNew()
-        match findProjectFile path |> Result.bind (fun p -> resolveProject p build configuration) with
+        match findProjectFile path |> Result.bind (fun p -> resolveProject p build configuration artifactsPath) with
         | Error e -> e, true // keep the current session alive
         | Ok r ->
             let resolveSecs = sw.Elapsed.TotalSeconds
@@ -269,6 +271,7 @@ let private toolsJson =
         "configuration": { "type": "string", "description": "Build configuration (default Debug)" },
         "prelude": { "type": "string", "description": "An .fsx script to #load into every new session (after this load, reset and timeout restarts), with its module and top-level opens opened; \"\" removes it. Remembered until changed" },
         "gc_server": { "type": "boolean", "description": "Run the session with Server GC (like ASP.NET apps) instead of workstation GC; matters for timing. Remembered until changed" },
+        "artifacts_path": { "type": "string", "description": "Directory for build output (bin, obj); nothing is written under the project. Remembered until changed; \"\" clears it" },
         "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Environment variables for the session process. Remembered until changed" } },
       "required": ["path"] } }
 ]
@@ -330,7 +333,7 @@ let run () =
                 | true, v when v.ValueKind = JsonValueKind.Object ->
                     Some [ for p in v.EnumerateObject() -> p.Name, p.Value.ToString() ]
                 | _ -> None
-            front.LoadProject(path, argBool a "build" true, config, argStrOpt a "prelude", gcServer, env)
+            front.LoadProject(path, argBool a "build" true, config, argStrOpt a "prelude", gcServer, argStrOpt a "artifacts_path", env)
         | "bindings" -> front.Bindings ct
         | "profile" ->
             let mode = match str a "mode" with "alloc" -> Profiler.Alloc | _ -> Profiler.Cpu

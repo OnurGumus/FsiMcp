@@ -87,12 +87,13 @@ let private closureItems =
 
 /// Ask MSBuild for the project's runtime closure instead of rewriting reference-assembly paths.
 /// NB: -getItem without a target only EVALUATES; these items are filled by targets and come back [].
-let resolveProject (projectFile: string) (build: bool) (configuration: string) : Result<Resolved, string> =
+let resolveProject (projectFile: string) (build: bool) (configuration: string) (artifactsPath: string option) : Result<Resolved, string> =
     let target = if build then "Build" else "ResolveReferences"
     let args =
         [ "msbuild"; projectFile; "-restore"; $"-t:{target}"; $"-p:Configuration={configuration}"; "-nologo"
           "-getProperty:TargetPath"; "-getItem:ReferencePath" ]
         @ (closureItems |> List.map (fun i -> "-getItem:" + i))
+        @ (artifactsPath |> Option.map (fun p -> $"-p:ArtifactsPath={p}") |> Option.toList)
     let code, out, err = runProcess "dotnet" args (Path.GetDirectoryName projectFile)
     let jsonStart = out.IndexOf('{')
     if code <> 0 || jsonStart < 0 then
