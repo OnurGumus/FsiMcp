@@ -21,12 +21,13 @@ typecheck  let f x = ...             # check against your types without running
 Requires the [.NET 10 SDK](https://dotnet.microsoft.com/download).
 
 ```sh
-claude mcp add --scope user fsi -- dnx FsiMcp --yes
+dotnet tool install -g FsiMcp
+claude mcp add --scope user fsi -- fsi-mcp
 ```
 
-Any other MCP client: run `dnx FsiMcp --yes` as a stdio server
-([config snippets](https://github.com/OnurGumus/FsiMcp/blob/main/docs/how-it-works.md#client-configuration)),
-or `dotnet tool install -g FsiMcp` and run `fsi-mcp`.
+Any other MCP client: add `fsi-mcp` as a stdio server
+([config snippets](https://github.com/OnurGumus/FsiMcp/blob/main/docs/how-it-works.md#client-configuration)).
+Prefer not to install? `dnx FsiMcp --yes` runs it straight from NuGet.
 
 ## Built for real projects
 

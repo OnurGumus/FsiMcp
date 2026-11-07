@@ -43,25 +43,30 @@ A failed build returns only the compiler errors and keeps the current session ru
 
 ## Client configuration
 
+Install once with `dotnet tool install -g FsiMcp` (update with `dotnet tool update -g FsiMcp`), then:
+
 **Claude Code**
 
 ```sh
-claude mcp add --scope user fsi -- dnx FsiMcp --yes
+claude mcp add --scope user fsi -- fsi-mcp
 ```
 
 **VS Code** (`.vscode/mcp.json`)
 
 ```json
-{ "servers": { "fsi": { "type": "stdio", "command": "dnx", "args": ["FsiMcp", "--yes"] } } }
+{ "servers": { "fsi": { "type": "stdio", "command": "fsi-mcp" } } }
 ```
 
 **Claude Desktop, Cursor and other `mcpServers` clients**
 
 ```json
-{ "mcpServers": { "fsi": { "command": "dnx", "args": ["FsiMcp", "--yes"] } } }
+{ "mcpServers": { "fsi": { "command": "fsi-mcp" } } }
 ```
 
-With `dotnet tool install -g FsiMcp`, use the command `fsi-mcp` instead of `dnx FsiMcp --yes`.
+**Without installing:** use `dnx` with args `["FsiMcp", "--yes"]` instead of `fsi-mcp`. The first launch
+downloads the package, which can take longer than some clients wait for a server to start, and on macOS the
+.NET CLI prints "Skipping NuGet package signature verification." to stdout during that download (most clients
+skip the non-JSON line). Later launches are fast and clean. The installed tool has neither issue.
 
 The server runs in the client's working directory, so coding agents can pass repo-relative paths to
 `load_project`; desktop apps usually start servers elsewhere, so use absolute paths there.
