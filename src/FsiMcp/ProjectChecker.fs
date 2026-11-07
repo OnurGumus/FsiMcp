@@ -119,10 +119,19 @@ type Checker() =
             |> Result.bind (fun args ->
                 if not (missingRef args) then Ok args
                 else
-                    // A referenced project was never built: build once, then ask again.
-                    match resolveProject projectFile true configuration artifactsPath with
-                    | Error e -> Error $"A referenced assembly is missing and building the project failed:\n{e}"
-                    | Ok _ -> getArgs projectFile configuration artifactsPath true)
+                    // A referenced project was never built: build once, then ask again. References build
+                    // before the project, so a project whose own files fail to compile is still checkable.
+                    let built = resolveProject projectFile true configuration artifactsPath
+                    getArgs projectFile configuration artifactsPath true
+                    |> Result.bind (fun args ->
+                        if not (missingRef args) then Ok args
+                        else
+                            let missing =
+                                args
+                                |> Array.filter (fun a -> a.StartsWith "-r:" && not (File.Exists(a.Substring 3)))
+                                |> Array.map (fun a -> a.Substring 3)
+                            let why = match built with Error e -> $"\nThe build failed:\n{e}" | Ok _ -> ""
+                            Error $"Referenced assemblies are missing even after building the project:\n{String.Join('\n', missing)}{why}"))
         match args with
         | Error e -> Error e
         | Ok args ->

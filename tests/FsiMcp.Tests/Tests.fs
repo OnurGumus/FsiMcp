@@ -298,6 +298,13 @@ let ``check_project: an overlay outside the project is checked last`` () =
     Assert.Empty(errors r)
 
 [<Fact>]
+let ``check_project: an added overlay is checked too`` () =
+    let dir = copyFixture "SampleLib"
+    use s = start ()
+    let r = checkOn s dir [| {| path = "New.fs"; content = "module SampleLib.New\nlet v : string = SampleLib.Lib.version\n" |} |] |> ok
+    Assert.Equal<(string * int * string) list>([ "New.fs", 2, "FS0001" ], errors r |> List.map where)
+
+[<Fact>]
 let ``check_project: each check sees the current overlays and the files on disk`` () =
     let dir = copyFixture "SampleLib"
     use s = start ()
@@ -322,6 +329,14 @@ let ``check_project checks a project whose reference was never built`` () =
     use s = start ()
     let r = checkOn s (Path.Combine(root, "AppWithRef")) [||] |> ok
     Assert.Empty(errors r)
+
+[<Fact>]
+let ``check_project checks a broken project whose reference was never built`` () =
+    let root = copyFixtures [ "SampleLib"; "AppWithRef" ]
+    File.WriteAllText(Path.Combine(root, "AppWithRef", "Program.fs"), "module AppWithRef.Program\nlet doubled : string = SampleLib.Lib.version * 2\n")
+    use s = start ()
+    let r = checkOn s (Path.Combine(root, "AppWithRef")) [||] |> ok
+    Assert.Equal<(string * int * string) list>([ "Program.fs", 2, "FS0001" ], errors r |> List.map where)
 
 [<Fact>]
 let ``check_project refreshes its arguments after the project file changes`` () =

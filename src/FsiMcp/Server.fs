@@ -304,7 +304,7 @@ let private toolsJson =
         "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Environment variables for the session process. Remembered until changed" } },
       "required": ["path"] } },
   { "name": "check_project",
-    "description": "Type-check a project without building or running it, optionally with some files' contents replaced (overlays) or added; returns compiler diagnostics. Never touches the F# Interactive session.",
+    "description": "Type-check a project without building or running it, optionally with some files' contents replaced (overlays) or added; returns compiler diagnostics. Never touches the F# Interactive session. Referenced projects are checked as they were last built; load_project (or a build) refreshes them.",
     "inputSchema": { "type": "object", "properties": {
         "project": { "type": "string", "description": "Project file, or a directory containing exactly one project" },
         "configuration": { "type": "string", "description": "Build configuration (default Debug)" },
