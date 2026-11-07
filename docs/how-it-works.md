@@ -40,8 +40,9 @@ A failed build returns only the compiler errors and keeps the current session ru
   call, and output written between calls arrives with the next one.
 - `eval` takes `timeout_seconds` (default 120). On timeout or stack overflow the worker is replaced and the
   agent is told that bindings were lost.
-- Results also carry `structuredContent` for clients that read it: `load_project` returns its `references`
-  and `targetPath`, and `check_project` returns its `diagnostics` (path, line, column, severity, code, message).
+- `check_project` results also carry `structuredContent` for clients that read it: its `diagnostics` (path,
+  line, column, severity, code, message). `load_project` adds `structuredContent` with its `references` and
+  `targetPath` only when called with `return_references: true`; otherwise its result is text only, as in 0.2.0.
 
 ## Session options
 
@@ -52,13 +53,13 @@ A failed build returns only the compiler errors and keeps the current session ru
 - `gc_server`: run the session under Server GC, as ASP.NET apps do. Allocation-heavy code can run about twice
   as fast under it, so time code under the GC it will really run with.
 - `artifacts_path`: a directory for build output (`bin`, `obj`), so nothing is written under the project.
-  `""` clears it.
+  A relative path resolves against the server's working folder. `""` clears it.
 - `env`: environment variables for the session process.
 
 ## Checking a project
 
-`check_project` type-checks a project without building it or touching the F# Interactive session. It
-asks MSBuild for the compiler arguments with a design-time run (`ResolveAssemblyReferencesDesignTime`,
+`check_project` type-checks a project without touching the F# Interactive session, and without building it
+except when a referenced project needs it (below). It asks MSBuild for the compiler arguments with a design-time run (`ResolveAssemblyReferencesDesignTime`,
 `ResolveProjectReferencesDesignTime`, `ResolvePackageDependenciesDesignTime`,
 `FindReferenceAssembliesForReferences`, `CoreCompile` with `ProvideCommandLineArgs` and `SkipCompilerExecution`),
 then type-checks the sources with `FSharpChecker` in the server process.
@@ -67,8 +68,15 @@ then type-checks the sources with `FSharpChecker` in the server process.
   it. A path that is not one of the project's files is added, and checked last.
 - The arguments are cached per project, configuration and artifacts path. The cache is refreshed when the
   project file or `Directory.Build.props`, `Directory.Build.targets` or `Directory.Packages.props` changes.
-- A referenced project that has never been built triggers one build. Referenced projects are otherwise
-  checked as they were last built; `load_project` or a build refreshes them.
+- A referenced project that has never been built, or that changed since it was last built, triggers one
+  build first. The design-time run also returns `ReferencePath`; its project-reference items name the
+  referenced project and its output assembly. A reference is stale when a `.fs`, `.fsi` or `.fsproj` file
+  under its folder (skipping `bin/`, `obj/`, hidden folders, the artifacts path and nested projects' folders)
+  is newer than that assembly. The build is the same one `load_project` runs; it is tried once per change,
+  so a reference that fails to build is checked as last built rather than rebuilt on every check.
+- Without `artifacts_path`, the one remembered from `load_project` is used.
+- A client that gives up sends `notifications/cancelled`: the check stops (its MSBuild run is killed, or
+  the type-check is cancelled) and frees the server for the next call.
 
 ## Profiling
 
@@ -126,7 +134,7 @@ The server runs in the client's working directory, so coding agents can pass rep
 ## Development
 
 ```sh
-dotnet test -c Release                           # drives the real server over stdio (~40 s)
+dotnet test -c Release                           # drives the real server over stdio (a few minutes)
 dotnet pack src/FsiMcp -c Release -o artifacts
 ```
 

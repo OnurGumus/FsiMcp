@@ -50,7 +50,7 @@ Prefer not to install? `dnx FsiMcp --yes` runs it straight from NuGet.
 | `load_project` | build a project and start a session with it loaded |
 | `eval` | run F#; state persists between calls |
 | `typecheck` | check code against the session without running it |
-| `check_project` | type-check the project, with edited files in memory, without building |
+| `check_project` | type-check the project, with edited files in memory, without building it (a referenced project that changed is rebuilt first) |
 | `reset` | fresh session, same project |
 | `profile` | run F# like `eval` and report where the CPU time or the allocations went |
 | `bindings` | list what the session has defined |
