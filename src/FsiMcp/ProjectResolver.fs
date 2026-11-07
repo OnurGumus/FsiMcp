@@ -47,6 +47,15 @@ let runProcess (file: string) (args: string list) (cwd: string) =
     p.WaitForExit()
     p.ExitCode, out.Result, err.Result
 
+/// The error lines of a failed MSBuild run (else its first 40 lines). On failure MSBuild still prints the
+/// item JSON (hundreds of KB) before the errors: keep the errors.
+let msbuildErrors (out: string) (err: string) =
+    let lines = (out + "\n" + err).Split('\n') |> Array.map (fun l -> l.TrimEnd())
+    let errors =
+        lines |> Array.filter (fun l -> l.Contains(": error ") || l.Contains("error MSB") || l.Contains("error NU"))
+    if errors.Length > 0 then errors |> Array.distinct |> String.concat "\n"
+    else String.Join("\n", lines |> Array.filter ((<>) "") |> Array.truncate 40)
+
 type Resolved =
     { ProjectFile: string
       TargetPath: string
@@ -97,14 +106,7 @@ let resolveProject (projectFile: string) (build: bool) (configuration: string) (
     let code, out, err = runProcess "dotnet" args (Path.GetDirectoryName projectFile)
     let jsonStart = out.IndexOf('{')
     if code <> 0 || jsonStart < 0 then
-        // On failure MSBuild still prints the item JSON (hundreds of KB) before the errors: keep the errors.
-        let lines = (out + "\n" + err).Split('\n') |> Array.map (fun l -> l.TrimEnd())
-        let errors =
-            lines |> Array.filter (fun l -> l.Contains(": error ") || l.Contains("error MSB") || l.Contains("error NU"))
-        let shown =
-            if errors.Length > 0 then errors |> Array.distinct |> String.concat "\n"
-            else String.Join("\n", lines |> Array.filter ((<>) "") |> Array.truncate 40)
-        Error(clip 6000 $"Build/resolve failed (dotnet msbuild exit {code}); the previous session is still running.\n{shown}")
+        Error(clip 6000 $"Build/resolve failed (dotnet msbuild exit {code}); the previous session is still running.\n{msbuildErrors out err}")
     else
     use doc = JsonDocument.Parse(out.Substring jsonStart)
     let root = doc.RootElement

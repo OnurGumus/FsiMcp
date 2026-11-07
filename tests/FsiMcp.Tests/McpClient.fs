@@ -106,3 +106,14 @@ let copyFixture (name: string) =
     for f in Directory.GetFiles src do
         File.Copy(f, Path.Combine(dest, Path.GetFileName f))
     dest
+
+/// Copy several fixture projects side by side into one fresh temp root (for project references); returns the root.
+let copyFixtures (names: string list) =
+    let root = Path.Combine(Path.GetTempPath(), "fsi-mcp-tests", Guid.NewGuid().ToString("N"))
+    for name in names do
+        let src = Path.Combine(fixturesDir, name)
+        let dest = Path.Combine(root, name)
+        Directory.CreateDirectory dest |> ignore
+        for f in Directory.GetFiles src do
+            File.Copy(f, Path.Combine(dest, Path.GetFileName f))
+    root

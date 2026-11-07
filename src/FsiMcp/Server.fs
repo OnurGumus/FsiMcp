@@ -104,6 +104,8 @@ type private Front(log: TextWriter) =
     let mutable artifactsPath: string option = None
     let mutable extraEnv: (string * string) list = []
     let mutable lastSurface: (string * string list) option = None
+    // check_project runs here in the server process, never in the worker.
+    let checker = lazy (ProjectChecker.Checker())
 
     let workerEnv () =
         (if gcServer then [ "DOTNET_gcServer", "1" ] else []) @ extraEnv
@@ -222,6 +224,25 @@ type private Front(log: TextWriter) =
                   IsError = false
                   Structured = Some(box {| references = Array.ofList stableRefs; targetPath = r.TargetPath |}) }
 
+    /// Type-check a project (with overlays) in the server process; the session is untouched.
+    member _.CheckProject(path: string, configuration: string, argArtifactsPath: string option, overlays: (string * string) list) =
+        let artifacts =
+            match argArtifactsPath with
+            | Some "" -> None
+            | Some p -> Some(Path.GetFullPath p)
+            | None -> artifactsPath
+        match findProjectFile path |> Result.bind (fun p -> checker.Value.Check(p, configuration, artifacts, overlays)) with
+        | Error e -> plain (e, true)
+        | Ok diags ->
+            let count s = diags |> List.filter (fun (d: ProjectChecker.Diagnostic) -> d.Severity = s) |> List.length
+            let oneLine (m: string) = String.Join(" ", m.Split([| ' '; '\n'; '\r'; '\t' |], StringSplitOptions.RemoveEmptyEntries))
+            let lines =
+                [ for d in diags -> $"{d.Path}:{d.Line}:{d.Column} {d.Severity} {d.Code} {oneLine d.Message}" ]
+            let errors, warnings = count "error", count "warning"
+            { Text = clip 20000 (String.Join("\n", $"{errors} errors, {warnings} warnings" :: lines))
+              IsError = false
+              Structured = Some(box {| diagnostics = Array.ofList diags |}) }
+
     member _.Bindings(ct) = request {| op = "bindings" |} (TimeSpan.FromSeconds 60.) ct |> plain
 
     /// Evaluate `code` while the server records the worker; append a CPU or allocation profile.
@@ -281,7 +302,19 @@ let private toolsJson =
         "gc_server": { "type": "boolean", "description": "Run the session with Server GC (like ASP.NET apps) instead of workstation GC; matters for timing. Remembered until changed" },
         "artifacts_path": { "type": "string", "description": "Directory for build output (bin, obj); nothing is written under the project. Remembered until changed; \"\" clears it" },
         "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Environment variables for the session process. Remembered until changed" } },
-      "required": ["path"] } }
+      "required": ["path"] } },
+  { "name": "check_project",
+    "description": "Type-check a project without building or running it, optionally with some files' contents replaced (overlays) or added; returns compiler diagnostics. Never touches the F# Interactive session.",
+    "inputSchema": { "type": "object", "properties": {
+        "project": { "type": "string", "description": "Project file, or a directory containing exactly one project" },
+        "configuration": { "type": "string", "description": "Build configuration (default Debug)" },
+        "artifacts_path": { "type": "string", "description": "Directory for MSBuild output (obj); default: the one remembered from load_project; \"\" = none" },
+        "overlays": { "type": "array", "description": "Files whose contents to replace for this check; a path that is not one of the project's source files is added as its last source file",
+          "items": { "type": "object", "properties": {
+              "path": { "type": "string", "description": "File path, absolute or relative to the project folder" },
+              "content": { "type": "string", "description": "The file's full contents" } },
+            "required": ["path", "content"] } } },
+      "required": ["project"] } }
 ]
 """
     )
@@ -343,6 +376,14 @@ let run () =
                 | _ -> None
             front.LoadProject(path, argBool a "build" true, config, argStrOpt a "prelude", gcServer, argStrOpt a "artifacts_path", env)
         | "bindings" -> front.Bindings ct
+        | "check_project" ->
+            let project = match str a "project" with "" -> "." | p -> p
+            let config = match str a "configuration" with "" -> "Debug" | c -> c
+            let overlays =
+                match a.TryGetProperty "overlays" with
+                | true, v when v.ValueKind = JsonValueKind.Array -> [ for o in v.EnumerateArray() -> str o "path", str o "content" ]
+                | _ -> []
+            front.CheckProject(project, config, argStrOpt a "artifacts_path", overlays)
         | "profile" ->
             let mode = match str a "mode" with "alloc" -> Profiler.Alloc | _ -> Profiler.Cpu
             front.Profile(str a "code", mode, argInt a "top" 15, argInt a "timeout_seconds" 120, ct)

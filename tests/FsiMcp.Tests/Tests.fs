@@ -33,7 +33,7 @@ let ``initialize and tools/list describe the server`` () =
     Assert.Equal("2025-06-18", init.GetProperty("protocolVersion").GetString())
     let tools = s.Request("tools/list", (obj ()))
     let names = [ for t in tools.GetProperty("tools").EnumerateArray() -> t.GetProperty("name").GetString() ]
-    Assert.Equal<string list>([ "eval"; "typecheck"; "reset"; "bindings"; "profile"; "load_project" ], names)
+    Assert.Equal<string list>([ "eval"; "typecheck"; "reset"; "bindings"; "profile"; "load_project"; "check_project" ], names)
 
 // ---------------------------------------------------------------- eval
 
@@ -244,3 +244,101 @@ let ``load_project returns its references as structured content`` () =
     Assert.Contains(refs, fun p -> p.EndsWith "SampleLib.dll")
     Assert.All(refs, fun p -> Assert.True(File.Exists p, p))
     Assert.DoesNotContain(refs, fun p -> p.Contains(Path.Combine(Path.GetTempPath(), "fsi-mcp") + string Path.DirectorySeparatorChar))
+
+// ---------------------------------------------------------------- check_project
+
+let checkOn (s: Server) (project: string) (overlays: obj[]) =
+    s.Call("check_project", {| project = project; artifacts_path = Path.Combine(project, "..", "artifacts"); overlays = overlays |})
+
+let errors (r: ToolResult) =
+    [ for d in r.Structured.Value.GetProperty("diagnostics").EnumerateArray() do
+        if d.GetProperty("severity").GetString() = "error" then yield d ]
+
+let where (d: Text.Json.JsonElement) =
+    d.GetProperty("path").GetString(), d.GetProperty("line").GetInt32(), d.GetProperty("code").GetString()
+
+let badLibrary = "module SampleLib.Lib\nlet version : int = \"x\"\n"
+
+[<Fact>]
+let ``check_project: a clean project has no errors and nothing is written under it`` () =
+    let dir = copyFixture "SampleLib"
+    use s = start ()
+    let r = checkOn s dir [||] |> ok
+    Assert.Empty(errors r)
+    has "0 errors" r
+    Assert.False(Directory.Exists(Path.Combine(dir, "obj")))
+    Assert.False(Directory.Exists(Path.Combine(dir, "bin")))
+
+[<Fact>]
+let ``check_project: an overlay replaces the file, and the session is untouched`` () =
+    let dir = copyFixture "SampleLib"
+    use s = start ()
+    s.Eval "let kept = 42" |> ok |> ignore
+    let r = checkOn s dir [| {| path = Path.Combine(dir, "Library.fs"); content = badLibrary |} |] |> ok
+    has "1 errors" r
+    has "Library.fs:2:" r
+    let e = (errors r).Head
+    Assert.Equal(("Library.fs", 2, "FS0001"), where e)
+    Assert.Equal(21, e.GetProperty("column").GetInt32())
+    s.Eval "kept" |> ok |> has "val it: int = 42"
+
+[<Fact>]
+let ``check_project: overlay paths may be relative to the project folder`` () =
+    let dir = copyFixture "SampleLib"
+    use s = start ()
+    let r = checkOn s dir [| {| path = "Library.fs"; content = badLibrary |} |] |> ok
+    has "1 errors" r
+    Assert.Equal<(string * int * string) list>([ "Library.fs", 2, "FS0001" ], errors r |> List.map where)
+
+[<Fact>]
+let ``check_project: an overlay outside the project is checked last`` () =
+    let dir = copyFixture "SampleLib"
+    use s = start ()
+    let r = checkOn s dir [| {| path = "New.fs"; content = "module SampleLib.New\nlet v : int = SampleLib.Lib.version\n" |} |] |> ok
+    Assert.Empty(errors r)
+
+[<Fact>]
+let ``check_project: each check sees the current overlays and the files on disk`` () =
+    let dir = copyFixture "SampleLib"
+    use s = start ()
+    checkOn s dir [| {| path = "Library.fs"; content = badLibrary |} |] |> ok |> has "1 errors" // overlaid
+    Assert.Empty(errors (checkOn s dir [||] |> ok)) // overlay gone: the file on disk again
+    File.WriteAllText(Path.Combine(dir, "Library.fs"), "module SampleLib.Lib\nlet version = 1\nlet bad : string = 2\n")
+    let r = checkOn s dir [||] |> ok // edited on disk
+    Assert.Equal<(string * int * string) list>([ "Library.fs", 3, "FS0001" ], errors r |> List.map where)
+
+[<Fact>]
+let ``check_project works on an up-to-date project`` () =
+    let dir = copyFixture "SampleLib"
+    use s = start ()
+    s.Call("load_project", {| path = dir; artifacts_path = Path.Combine(dir, "..", "artifacts") |}) |> ok |> ignore
+    Assert.Empty(errors (checkOn s dir [||] |> ok))
+    let r = checkOn s dir [| {| path = "Library.fs"; content = badLibrary |} |] |> ok
+    Assert.Equal<(string * int * string) list>([ "Library.fs", 2, "FS0001" ], errors r |> List.map where)
+
+[<Fact>]
+let ``check_project checks a project whose reference was never built`` () =
+    let root = copyFixtures [ "SampleLib"; "AppWithRef" ]
+    use s = start ()
+    let r = checkOn s (Path.Combine(root, "AppWithRef")) [||] |> ok
+    Assert.Empty(errors r)
+
+[<Fact>]
+let ``check_project refreshes its arguments after the project file changes`` () =
+    let dir = copyFixture "SampleLib"
+    use s = start ()
+    Assert.Empty(errors (checkOn s dir [||] |> ok))
+    let proj = Path.Combine(dir, "SampleLib.fsproj")
+    File.WriteAllText(proj, File.ReadAllText(proj).Replace("""<Compile Include="Library.fs" />""", """<Compile Include="Library.fs" /><Compile Include="Extra.fs" />"""))
+    File.WriteAllText(Path.Combine(dir, "Extra.fs"), "module SampleLib.Extra\nlet bad : int = \"x\"\n")
+    let r = checkOn s dir [||] |> ok
+    Assert.Equal<(string * int * string) list>([ "Extra.fs", 2, "FS0001" ], errors r |> List.map where)
+
+[<Fact>]
+let ``check_project reports a failed MSBuild run as an error`` () =
+    let dir = copyFixture "SampleLib"
+    let proj = Path.Combine(dir, "SampleLib.fsproj")
+    File.WriteAllText(proj, File.ReadAllText(proj).Replace("13.0.3", "999.0.0-nope"))
+    use s = start ()
+    checkOn s dir [||] |> failed |> has "NU1102"
+

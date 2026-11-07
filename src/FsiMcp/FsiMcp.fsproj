@@ -27,6 +27,7 @@
   <ItemGroup>
     <Compile Include="Text.fs" />
     <Compile Include="ProjectResolver.fs" />
+    <Compile Include="ProjectChecker.fs" />
     <Compile Include="Worker.fs" />
     <Compile Include="Profiler.fs" />
     <Compile Include="Server.fs" />
