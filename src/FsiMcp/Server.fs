@@ -59,7 +59,11 @@ type private WorkerProc(cwd: string, log: TextWriter, env: (string * string) lis
         t.Start()
 
     /// None = no answer within the timeout (or cancelled).
-    member _.Request(msg: obj, timeout: TimeSpan, ct: CancellationToken) : (string * bool) option =
+    member this.Request(msg: obj, timeout: TimeSpan, ct: CancellationToken) : (string * bool) option =
+        this.RequestRaw(msg, timeout, ct) |> Option.map (fun (t, e, _) -> t, e)
+
+    /// Like Request, plus the reply's whole JSON object (None when the worker died without replying).
+    member _.RequestRaw(msg: obj, timeout: TimeSpan, ct: CancellationToken) : (string * bool * JsonElement option) option =
         writeLine p.StandardInput msg
         let read = p.StandardOutput.ReadLineAsync()
         if Task.WaitAny([| read :> Task; Task.Delay(timeout, ct) |]) <> 0 then None
@@ -73,11 +77,12 @@ type private WorkerProc(cwd: string, log: TextWriter, env: (string * string) lis
                 Some(
                     $"The worker process died (exit code {exitCode}). State is lost; the next call starts a fresh session.\n{detail}"
                         .TrimEnd(),
-                    true
+                    true,
+                    None
                 )
             | line ->
                 use d = JsonDocument.Parse line
-                Some(str d.RootElement "text", d.RootElement.GetProperty("isError").GetBoolean())
+                Some(str d.RootElement "text", d.RootElement.GetProperty("isError").GetBoolean(), Some(d.RootElement.Clone()))
 
     member _.Alive = not p.HasExited
     member _.Pid = p.Id
@@ -103,6 +108,8 @@ type private Front(log: TextWriter) =
     let mutable gcServer = false
     let mutable artifactsPath: string option = None
     let mutable extraEnv: (string * string) list = []
+    // The prelude's outcome in the session spawn() last started; None = no prelude.
+    let mutable preludeOutcome: (bool * string) option = None
     let mutable lastSurface: (string * string list) option = None
     // check_project runs here in the server process, never in the worker.
     let checker = lazy (ProjectChecker.Checker())
@@ -122,11 +129,19 @@ type private Front(log: TextWriter) =
             | Some r -> r.Managed, r.Native |> List.map (fun (a, b) -> [| a; b |])
             | None -> [], []
         let init = {| op = "init"; refs = refs; native = native; prelude = Option.defaultValue "" prelude |}
-        match w.Request(init, TimeSpan.FromSeconds 120., CancellationToken.None) with
-        | Some(text, false) ->
+        preludeOutcome <- None
+        match w.RequestRaw(init, TimeSpan.FromSeconds 120., CancellationToken.None) with
+        | Some(text, false, root) ->
             worker <- Some w
+            preludeOutcome <-
+                root
+                |> Option.bind (fun r ->
+                    match r.TryGetProperty "prelude" with
+                    | true, p when p.ValueKind = JsonValueKind.Object ->
+                        Some(p.GetProperty("loaded").GetBoolean(), str p "message")
+                    | _ -> None)
             Ok text
-        | Some(text, true) ->
+        | Some(text, true, _) ->
             w.Kill()
             Error text
         | None ->
@@ -138,14 +153,16 @@ type private Front(log: TextWriter) =
         | Some w when w.Alive -> Ok w
         | _ -> spawn () |> Result.map (fun _ -> worker.Value)
 
-    let request (msg: obj) (timeout: TimeSpan) (ct: CancellationToken) =
+    /// The reply text and error flag, the worker's reply object (when it sent one), and whether this
+    /// call lost the session (timeout or crash).
+    let requestFull (msg: obj) (timeout: TimeSpan) (ct: CancellationToken) =
         match ensure () with
-        | Error e -> $"Could not start the F# session: {e}", true
+        | Error e -> ($"Could not start the F# session: {e}", true), None, false
         | Ok w ->
-            match w.Request(msg, timeout, ct) with
-            | Some r ->
+            match w.RequestRaw(msg, timeout, ct) with
+            | Some(text, isError, root) ->
                 if not w.Alive then worker <- None
-                r
+                (text, isError), root, root.IsNone
             | None ->
                 let why = if ct.IsCancellationRequested then "was cancelled" else $"timed out after {timeout.TotalSeconds:F0}s"
                 let restart =
@@ -154,7 +171,11 @@ type private Front(log: TextWriter) =
                         let refs = if loaded.IsSome then "; project references re-applied" else ""
                         $"A fresh session is ready ({t}{refs}). All earlier bindings are lost."
                     | Error e -> $"Restarting failed: {e}"
-                $"Evaluation {why}; the worker process was killed. {restart}", true
+                ($"Evaluation {why}; the worker process was killed. {restart}", true), None, true
+
+    let request (msg: obj) (timeout: TimeSpan) (ct: CancellationToken) =
+        let r, _, _ = requestFull msg timeout ct
+        r
 
     member _.Warm() = ensure () |> ignore
 
@@ -162,8 +183,30 @@ type private Front(log: TextWriter) =
         kill ()
         snapshotDir |> Option.iter Snapshot.delete
 
-    member _.Eval(code: string, timeoutSeconds: int, ct) =
-        request {| op = "eval"; code = code |} (TimeSpan.FromSeconds(float timeoutSeconds)) ct |> plain
+    member _.Eval(code: string, timeoutSeconds: int, returnStructured: bool, ct) =
+        let sw = Stopwatch.StartNew()
+        let (text, isError), root, restarted =
+            requestFull {| op = "eval"; code = code |} (TimeSpan.FromSeconds(float timeoutSeconds)) ct
+        if not returnStructured then plain (text, isError)
+        else
+            let stats = root |> Option.bind (fun r -> match r.TryGetProperty "stats" with | true, st -> Some st | _ -> None)
+            let num (name: string) = stats |> Option.map (fun st -> st.GetProperty(name).GetDouble()) |> Option.defaultValue 0.0
+            // A lost session has no stats from the worker: report the wall time spent, and zero for the rest.
+            let elapsed = if stats.IsSome then num "elapsedMs" else sw.Elapsed.TotalMilliseconds
+            { Text = text
+              IsError = isError
+              Structured =
+                Some(
+                    box
+                        {| ok = not isError
+                           restarted = restarted
+                           stats =
+                            {| elapsedMs = elapsed
+                               allocatedBytes = num "allocatedBytes"
+                               gen0 = int (num "gen0")
+                               gen1 = int (num "gen1")
+                               gen2 = int (num "gen2") |} |}
+                ) }
 
     member _.Typecheck(code: string, ct) =
         request {| op = "typecheck"; code = code |} (TimeSpan.FromSeconds 120.) ct |> plain
@@ -223,7 +266,12 @@ type private Front(log: TextWriter) =
                 { Text = sb.ToString().TrimEnd()
                   IsError = false
                   Structured =
-                    if returnReferences then Some(box {| references = Array.ofList stableRefs; targetPath = r.TargetPath |})
+                    if returnReferences then
+                        let prelude =
+                            match preludeOutcome with
+                            | Some(loaded, message) -> box {| loaded = loaded; message = message |}
+                            | None -> null
+                        Some(box {| references = Array.ofList stableRefs; targetPath = r.TargetPath; prelude = prelude |})
                     else None }
 
     /// Type-check a project (with overlays) in the server process; the session is untouched.
@@ -278,7 +326,8 @@ let private toolsJson =
     "description": "Evaluate F# code in a persistent F# Interactive session (like dotnet fsi). Bindings, types, opens and #r persist across calls until reset/load_project. Returns printed output, `val x: T` for each binding (types only; evaluate an expression to see a value), `val it: T = value` for a trailing expression, and compiler diagnostics; slow or allocation-heavy evals end with a [time · bytes allocated · GC counts] line. Values print with limits and long output is clipped: project the fields you need (List.map) instead of printing large records. Expensive results stay in memory, so bind them once and inspect them in later calls. An eval that fails keeps NOTHING from it (bindings, opens, #load), so put a #load in its own eval. Do not end code with ;;",
     "inputSchema": { "type": "object", "properties": {
         "code": { "type": "string", "description": "F# code: declarations, expressions, #r/#load/open directives" },
-        "timeout_seconds": { "type": "integer", "description": "Kill the session after this many seconds (default 120); state is lost" } },
+        "timeout_seconds": { "type": "integer", "description": "Kill the session after this many seconds (default 120); state is lost" },
+        "return_structured": { "type": "boolean", "description": "Also return the outcome and cost as structured content" } },
       "required": ["code"] } },
   { "name": "typecheck",
     "description": "Type-check F# code against the current session (loaded project + earlier bindings) WITHOUT running it or binding anything. Returns inferred signatures, or compiler diagnostics.",
@@ -365,7 +414,7 @@ let run () =
 
     let callTool (name: string) (a: JsonElement) (ct: CancellationToken) =
         match name with
-        | "eval" -> front.Eval(str a "code", argInt a "timeout_seconds" 120, ct)
+        | "eval" -> front.Eval(str a "code", argInt a "timeout_seconds" 120, argBool a "return_structured" false, ct)
         | "typecheck" -> front.Typecheck(str a "code", ct)
         | "reset" -> front.Reset(argStrOpt a "prelude")
         | "load_project" ->

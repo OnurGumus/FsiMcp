@@ -255,6 +255,79 @@ let ``load_project without return_references and eval carry no structured conten
     Assert.True((s.Eval "1 + 1" |> ok).Structured.IsNone, "eval returned structuredContent")
     Assert.True((s.Eval "let broken: int = \"x\"" |> failed).Structured.IsNone, "a failed eval returned structuredContent")
 
+// ---------------------------------------------------------------- 0.4: structured eval and prelude outcome
+
+let structuredEval (s: Server) (code: string) =
+    s.Call("eval", {| code = code; return_structured = true |})
+
+[<Fact>]
+let ``eval structured: ok and stats`` () =
+    use s = start ()
+    let plainText = (s.Eval "[1..1000] |> List.sum" |> ok).Text
+    let r = structuredEval s "[1..1000] |> List.sum" |> ok
+    // The text may end with the cost line (shown only for slow evals), whose numbers differ per call.
+    let body (t: string) = t.Split('\n') |> Array.filter (fun l -> not (l.StartsWith "[" && l.Contains "allocated")) |> String.concat "\n"
+    Assert.Equal(body plainText, body r.Text)
+    let sc = r.Structured.Value
+    Assert.True(sc.GetProperty("ok").GetBoolean())
+    Assert.False(sc.GetProperty("restarted").GetBoolean())
+    let st = sc.GetProperty("stats")
+    Assert.True(st.GetProperty("elapsedMs").GetDouble() >= 0.0)
+    Assert.True(st.GetProperty("allocatedBytes").GetDouble() >= 0.0)
+    for g in [ "gen0"; "gen1"; "gen2" ] do
+        Assert.True(st.GetProperty(g).GetInt32() >= 0)
+
+[<Fact>]
+let ``eval structured: a failed eval is not ok`` () =
+    use s = start ()
+    let r = structuredEval s "let x : int = \"s\"" |> failed
+    let sc = r.Structured.Value
+    Assert.False(sc.GetProperty("ok").GetBoolean())
+    Assert.False(sc.GetProperty("restarted").GetBoolean())
+    Assert.True(sc.GetProperty("stats").GetProperty("allocatedBytes").GetDouble() >= 0.0)
+
+[<Fact>]
+let ``eval structured: a timeout reports restarted`` () =
+    use s = start ()
+    let r = s.Call("eval", {| code = "while true do ()"; timeout_seconds = 2; return_structured = true |}) |> failed
+    let sc = r.Structured.Value
+    Assert.False(sc.GetProperty("ok").GetBoolean())
+    Assert.True(sc.GetProperty("restarted").GetBoolean())
+    Assert.True(sc.GetProperty("stats").GetProperty("elapsedMs").GetDouble() >= 0.0)
+
+[<Fact>]
+let ``eval without the flag has no structured content`` () =
+    use s = start ()
+    Assert.True((s.Eval "1 + 1" |> ok).Structured.IsNone)
+    Assert.True((s.Call("eval", {| code = "1 + 1"; return_structured = false |}) |> ok).Structured.IsNone)
+
+[<Fact>]
+let ``load_project structured: a broken prelude is reported`` () =
+    let dir = copyFixture "SampleLib"
+    let bad = Path.Combine(dir, "broken.fsx")
+    File.WriteAllText(bad, "let x : int = \"s\"\n")
+    use s = start ()
+    let r = s.Call("load_project", {| path = dir; prelude = bad; return_references = true |}) |> ok
+    let p = r.Structured.Value.GetProperty("prelude")
+    Assert.False(p.GetProperty("loaded").GetBoolean())
+    Assert.Contains("FAILED", p.GetProperty("message").GetString())
+
+[<Fact>]
+let ``load_project structured: a good prelude is loaded`` () =
+    let dir = copyFixture "SampleLib"
+    use s = start ()
+    let r = s.Call("load_project", {| path = dir; prelude = preludePath; return_references = true |}) |> ok
+    let p = r.Structured.Value.GetProperty("prelude")
+    Assert.True(p.GetProperty("loaded").GetBoolean())
+    Assert.Contains("loaded", p.GetProperty("message").GetString())
+
+[<Fact>]
+let ``load_project structured: no prelude is null`` () =
+    let dir = copyFixture "SampleLib"
+    use s = start ()
+    let r = s.Call("load_project", {| path = dir; return_references = true |}) |> ok
+    Assert.Equal(System.Text.Json.JsonValueKind.Null, r.Structured.Value.GetProperty("prelude").ValueKind)
+
 // ---------------------------------------------------------------- check_project
 
 let checkOn (s: Server) (project: string) (overlays: obj[]) =

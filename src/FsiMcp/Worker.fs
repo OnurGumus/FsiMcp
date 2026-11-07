@@ -100,7 +100,12 @@ type private Session(refs: string list, outCap: Capture, errCap: Capture) =
         outCap.Drain() |> ignore
         errCap.Drain() |> ignore
 
-    member _.Eval(code: string) : string * bool =
+    member this.Eval(code: string) : string * bool =
+        let text, isError, _ = this.EvalWithStats code
+        text, isError
+
+    /// Eval, plus what it cost: (elapsed ms, bytes allocated, GC counts gen0/1/2).
+    member _.EvalWithStats(code: string) : string * bool * (float * float * int[]) =
         let background = outCap.Drain() + errCap.Drain()
         let mutable result = Unchecked.defaultof<Choice<FsiValue option, exn> * FSharpDiagnostic[]>
         let mutable hostError: exn = null
@@ -175,7 +180,7 @@ type private Session(refs: string list, outCap: Capture, errCap: Capture) =
         if elapsed >= 0.5 || allocated >= 100e6 then
             add $"[{elapsed:F2} s · {formatBytes allocated} allocated · GCs gen0 {gcs[0]} / gen1 {gcs[1]} / gen2 {gcs[2]}]"
         let text = sb.ToString().TrimEnd()
-        (if text = "" then "ok (no output)" else text), isError
+        (if text = "" then "ok (no output)" else text), isError, (elapsed * 1000.0, allocated, gcs)
 
     /// What the session has bound so far: name and type.
     member _.Bindings() : string * bool =
@@ -194,12 +199,12 @@ type private Session(refs: string list, outCap: Capture, errCap: Capture) =
     /// `#load` a script, then open its module and replay its top-level `open`s in the session, so its
     /// helpers are usable unqualified, as if typed in. Each step is its own interaction: a failing
     /// open cannot roll back the load.
-    member this.LoadPrelude(path: string) : string =
+    member this.LoadPrelude(path: string) : string * bool =
         let name = Path.GetFileName path
-        if not (File.Exists path) then $"prelude {name}: NOT FOUND at {path}"
+        if not (File.Exists path) then $"prelude {name}: NOT FOUND at {path}", false
         else
         let loadText, loadFailed = this.Eval($"#load @\"{path}\"")
-        if loadFailed then $"prelude {name}: FAILED to load\n{clip 3000 loadText}"
+        if loadFailed then $"prelude {name}: FAILED to load\n{clip 3000 loadText}", false
         else
         let lines = File.ReadAllLines path
         let explicitModule =
@@ -223,7 +228,7 @@ type private Session(refs: string list, outCap: Capture, errCap: Capture) =
         let failed = results |> List.filter snd |> List.map fst
         let failedText = if failed.IsEmpty then "" else "; could not open " + String.Join(", ", failed)
         let openedText = String.Join(", ", opened)
-        $"prelude {name}: loaded; opened {openedText}{failedText}"
+        $"prelude {name}: loaded; opened {openedText}{failedText}", true
 
     member _.Typecheck(code: string) : string * bool =
         let parse, check, _ = fsi.ParseAndCheckInteraction code
@@ -259,6 +264,12 @@ let run () =
     Console.SetIn(new StringReader(""))
     installResolvers ()
     let reply (text: string, isError: bool) = writeLine protocolOut {| text = text; isError = isError |}
+    let replyWith (text: string, isError: bool) (extra: (string * obj) list) =
+        let d = Collections.Generic.Dictionary<string, obj>()
+        d["text"] <- box text
+        d["isError"] <- box isError
+        for k, v in extra do d[k] <- v
+        writeLine protocolOut d
     let mutable session: Session option = None
     let mutable line = protocolIn.ReadLine()
     while not (isNull line) do
@@ -280,8 +291,12 @@ let run () =
                 let ready = $"ready in {sw.Elapsed.TotalSeconds:F1}s (pid {Environment.ProcessId}, .NET {Environment.Version}, {gc})"
                 match str r "prelude" with
                 | "" -> reply (ready, false)
-                | path -> reply (ready + "\n" + s.LoadPrelude path, false)
-            | "eval", Some s -> reply (s.Eval(str r "code"))
+                | path ->
+                    let message, loaded = s.LoadPrelude path
+                    replyWith (ready + "\n" + message, false) [ "prelude", box {| loaded = loaded; message = message |} ]
+            | "eval", Some s ->
+                let text, isError, (ms, bytes, gcs) = s.EvalWithStats(str r "code")
+                replyWith (text, isError) [ "stats", box {| elapsedMs = ms; allocatedBytes = bytes; gen0 = gcs[0]; gen1 = gcs[1]; gen2 = gcs[2] |} ]
             | "typecheck", Some s -> reply (s.Typecheck(str r "code"))
             | "bindings", Some s -> reply (s.Bindings())
             | op, _ -> reply ($"worker: bad op '{op}' (or no session)", true)
