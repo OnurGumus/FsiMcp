@@ -10,6 +10,7 @@ open System.Reflection.Metadata
 open System.Reflection.PortableExecutable
 open System.Runtime.InteropServices
 open System.Text.Json
+open System.Threading
 open FsiMcp.Text
 
 /// RIDs this machine can run, most specific first (e.g. osx-arm64; osx; unix).
@@ -30,7 +31,9 @@ let ridRank (pathInPackage: string) =
         ridChain |> List.tryFindIndex (fun r -> String.Equals(r, rid, StringComparison.OrdinalIgnoreCase))
     else Some ridChain.Length
 
-let runProcess (file: string) (args: string list) (cwd: string) =
+/// Run a process to completion; when `ct` fires, its whole process tree is killed and
+/// OperationCanceledException is raised.
+let runProcessCancellable (file: string) (args: string list) (cwd: string) (ct: CancellationToken) =
     let psi = ProcessStartInfo(file)
     psi.WorkingDirectory <- cwd
     psi.UseShellExecute <- false
@@ -44,8 +47,14 @@ let runProcess (file: string) (args: string list) (cwd: string) =
     p.StandardInput.Close()
     let out = p.StandardOutput.ReadToEndAsync()
     let err = p.StandardError.ReadToEndAsync()
-    p.WaitForExit()
+    (
+        use _ = ct.Register(fun () -> try p.Kill(true) with _ -> ())
+        p.WaitForExit()
+    )
+    ct.ThrowIfCancellationRequested()
     p.ExitCode, out.Result, err.Result
+
+let runProcess (file: string) (args: string list) (cwd: string) = runProcessCancellable file args cwd CancellationToken.None
 
 /// The error lines of a failed MSBuild run (else its first 40 lines). On failure MSBuild still prints the
 /// item JSON (hundreds of KB) before the errors: keep the errors.
@@ -96,17 +105,18 @@ let private closureItems =
 
 /// Ask MSBuild for the project's runtime closure instead of rewriting reference-assembly paths.
 /// NB: -getItem without a target only EVALUATES; these items are filled by targets and come back [].
-let resolveProject (projectFile: string) (build: bool) (configuration: string) (artifactsPath: string option) : Result<Resolved, string> =
+/// `failNote` is appended to the first line of a failure message; `ct` kills the MSBuild run.
+let resolveProjectWith (ct: CancellationToken) (failNote: string) (projectFile: string) (build: bool) (configuration: string) (artifactsPath: string option) : Result<Resolved, string> =
     let target = if build then "Build" else "ResolveReferences"
     let args =
         [ "msbuild"; projectFile; "-restore"; $"-t:{target}"; $"-p:Configuration={configuration}"; "-nologo"
           "-getProperty:TargetPath"; "-getItem:ReferencePath" ]
         @ (closureItems |> List.map (fun i -> "-getItem:" + i))
         @ (artifactsPath |> Option.map (fun p -> $"-p:ArtifactsPath={p}") |> Option.toList)
-    let code, out, err = runProcess "dotnet" args (Path.GetDirectoryName projectFile)
+    let code, out, err = runProcessCancellable "dotnet" args (Path.GetDirectoryName projectFile) ct
     let jsonStart = out.IndexOf('{')
     if code <> 0 || jsonStart < 0 then
-        Error(clip 6000 $"Build/resolve failed (dotnet msbuild exit {code}); the previous session is still running.\n{msbuildErrors out err}")
+        Error(clip 6000 $"Build/resolve failed (dotnet msbuild exit {code}){failNote}.\n{msbuildErrors out err}")
     else
     use doc = JsonDocument.Parse(out.Substring jsonStart)
     let root = doc.RootElement
@@ -211,6 +221,10 @@ let resolveProject (projectFile: string) (build: bool) (configuration: string) (
           Built = set (own @ builtRefs) |> Set.filter (fun p -> List.contains p keep || List.contains p own)
           Native = native
           Notes = List.ofSeq notes }
+
+/// load_project's resolve: never cancelled, and a failure leaves the previous session running.
+let resolveProject (projectFile: string) (build: bool) (configuration: string) (artifactsPath: string option) =
+    resolveProjectWith CancellationToken.None "; the previous session is still running" projectFile build configuration artifactsPath
 
 /// Public top-level types of an assembly (namespaces + F# modules), read from metadata without loading it.
 let publicSurface (path: string) =

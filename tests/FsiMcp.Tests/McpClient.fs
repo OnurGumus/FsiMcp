@@ -41,13 +41,25 @@ type Server(?cwd: string) =
         p.StandardInput.Write('\n')
         p.StandardInput.Flush()
 
-    /// Send a request and return its `result`. Every line the server writes must be JSON: anything else
-    /// (a stray printfn) throws here, which is how the tests check that the protocol stream stays clean.
-    member _.Request(``method``: string, prms: obj, ?timeout: TimeSpan) : JsonElement =
+    // Responses that arrived while waiting for another id.
+    let early = System.Collections.Generic.Dictionary<int, string>()
+
+    /// Send a request without waiting; returns its id (see Await).
+    member _.Send(``method``: string, prms: obj) : int =
         nextId <- nextId + 1
-        let id = nextId
-        write {| jsonrpc = "2.0"; id = id; ``method`` = ``method``; ``params`` = prms |}
+        write {| jsonrpc = "2.0"; id = nextId; ``method`` = ``method``; ``params`` = prms |}
+        nextId
+
+    /// Wait for the response to request `id` and return its `result`. Every line the server writes must be
+    /// JSON: anything else (a stray printfn) throws here, which is how the tests check that the protocol
+    /// stream stays clean.
+    member _.Await(id: int, ``method``: string, ?timeout: TimeSpan) : JsonElement =
         let deadline = DateTime.UtcNow + defaultArg timeout (TimeSpan.FromSeconds 180.)
+        let resultOf (line: string) =
+            use doc = JsonDocument.Parse line
+            match doc.RootElement.TryGetProperty "result" with
+            | true, result -> result.Clone()
+            | _ -> failwith $"error response: {line}"
         let rec loop () =
             let read = p.StandardOutput.ReadLineAsync()
             let remaining = deadline - DateTime.UtcNow
@@ -57,25 +69,38 @@ type Server(?cwd: string) =
             | null -> failwith $"server exited; stderr:\n{stderr}"
             | line ->
                 use doc = JsonDocument.Parse line
-                let r = doc.RootElement
-                match r.TryGetProperty "id" with
-                | true, v when v.ValueKind = JsonValueKind.Number && v.GetInt32() = id ->
-                    match r.TryGetProperty "result" with
-                    | true, result -> result.Clone()
-                    | _ -> failwith $"error response: {line}"
+                match doc.RootElement.TryGetProperty "id" with
+                | true, v when v.ValueKind = JsonValueKind.Number ->
+                    if v.GetInt32() = id then resultOf line
+                    else
+                        early[v.GetInt32()] <- line
+                        loop ()
                 | _ -> loop ()
-        loop ()
+        match early.TryGetValue id with
+        | true, line ->
+            early.Remove id |> ignore
+            resultOf line
+        | _ -> loop ()
+
+    /// Send a request and return its `result`.
+    member this.Request(``method``: string, prms: obj, ?timeout: TimeSpan) : JsonElement =
+        let id = this.Send(``method``, prms)
+        match timeout with
+        | Some t -> this.Await(id, ``method``, t)
+        | None -> this.Await(id, ``method``)
 
     member _.Notify(``method``: string, prms: obj) = write {| jsonrpc = "2.0"; ``method`` = ``method``; ``params`` = prms |}
 
-    member this.Call(tool: string, args: obj) : ToolResult =
-        let r = this.Request("tools/call", {| name = tool; arguments = args |})
+    static member ToToolResult(r: JsonElement) : ToolResult =
         { Text = r.GetProperty("content").Item(0).GetProperty("text").GetString()
           IsError = r.GetProperty("isError").GetBoolean()
           Structured =
             match r.TryGetProperty "structuredContent" with
             | true, v -> Some v
             | _ -> None }
+
+    member this.Call(tool: string, args: obj) : ToolResult =
+        Server.ToToolResult(this.Request("tools/call", {| name = tool; arguments = args |}))
 
     member this.Eval(code: string) = this.Call("eval", {| code = code |})
     member this.Eval(code: string, timeoutSeconds: int) = this.Call("eval", {| code = code; timeout_seconds = timeoutSeconds |})

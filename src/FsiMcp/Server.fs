@@ -179,7 +179,7 @@ type private Front(log: TextWriter) =
             plain ($"Fresh session ({t}{refs}).", false)
         | Error e -> plain (e, true)
 
-    member _.LoadProject(path: string, build: bool, configuration: string, newPrelude: string option, newGcServer: bool option, newArtifactsPath: string option, newEnv: (string * string) list option) =
+    member _.LoadProject(path: string, build: bool, configuration: string, newPrelude: string option, newGcServer: bool option, newArtifactsPath: string option, newEnv: (string * string) list option, returnReferences: bool) =
         newPrelude |> Option.iter (fun p -> prelude <- (if p = "" then None else Some(Path.GetFullPath p)))
         newGcServer |> Option.iter (fun g -> gcServer <- g)
         newArtifactsPath |> Option.iter (fun p -> artifactsPath <- (if p = "" then None else Some(Path.GetFullPath p)))
@@ -222,18 +222,24 @@ type private Front(log: TextWriter) =
                 lastSurface <- Some(r.ProjectFile, surface)
                 { Text = sb.ToString().TrimEnd()
                   IsError = false
-                  Structured = Some(box {| references = Array.ofList stableRefs; targetPath = r.TargetPath |}) }
+                  Structured =
+                    if returnReferences then Some(box {| references = Array.ofList stableRefs; targetPath = r.TargetPath |})
+                    else None }
 
     /// Type-check a project (with overlays) in the server process; the session is untouched.
-    member _.CheckProject(path: string, configuration: string, argArtifactsPath: string option, overlays: (string * string) list) =
+    member _.CheckProject(path: string, configuration: string, argArtifactsPath: string option, overlays: (string * string) list, ct: CancellationToken) =
+        let cancelled = plain ("check_project was cancelled.", true)
+        if ct.IsCancellationRequested then cancelled else // gave up on while it waited for the gate
         let artifacts =
             match argArtifactsPath with
             | Some "" -> None
             | Some p -> Some(Path.GetFullPath p)
             | None -> artifactsPath
-        match findProjectFile path |> Result.bind (fun p -> checker.Value.Check(p, configuration, artifacts, overlays)) with
-        | Error e -> plain (e, true)
-        | Ok diags ->
+        match (try findProjectFile path |> Result.bind (fun p -> checker.Value.Check(p, configuration, artifacts, overlays, ct)) |> Some
+               with :? OperationCanceledException when ct.IsCancellationRequested -> None) with
+        | None -> cancelled
+        | Some(Error e) -> plain (e, true)
+        | Some(Ok diags) ->
             let count s = diags |> List.filter (fun (d: ProjectChecker.Diagnostic) -> d.Severity = s) |> List.length
             let oneLine (m: string) = String.Join(" ", m.Split([| ' '; '\n'; '\r'; '\t' |], StringSplitOptions.RemoveEmptyEntries))
             let lines =
@@ -300,15 +306,16 @@ let private toolsJson =
         "configuration": { "type": "string", "description": "Build configuration (default Debug)" },
         "prelude": { "type": "string", "description": "An .fsx script to #load into every new session (after this load, reset and timeout restarts), with its module and top-level opens opened; \"\" removes it. Remembered until changed" },
         "gc_server": { "type": "boolean", "description": "Run the session with Server GC (like ASP.NET apps) instead of workstation GC; matters for timing. Remembered until changed" },
-        "artifacts_path": { "type": "string", "description": "Directory for build output (bin, obj); nothing is written under the project. Remembered until changed; \"\" clears it" },
+        "artifacts_path": { "type": "string", "description": "Directory for build output (bin, obj); nothing is written under the project. A relative path resolves against the server's working folder. Remembered until changed; \"\" clears it" },
+        "return_references": { "type": "boolean", "description": "Also return the resolved reference paths and target path as structured content" },
         "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Environment variables for the session process. Remembered until changed" } },
       "required": ["path"] } },
   { "name": "check_project",
-    "description": "Type-check a project without building or running it, optionally with some files' contents replaced (overlays) or added; returns compiler diagnostics. Never touches the F# Interactive session. Referenced projects are checked as they were last built; load_project (or a build) refreshes them.",
+    "description": "Type-check a project without running it and without building it (except once when a referenced project needs it), optionally with some files' contents replaced (overlays) or added; returns compiler diagnostics. Never touches the F# Interactive session. A referenced project changed since it was last built is rebuilt first.",
     "inputSchema": { "type": "object", "properties": {
         "project": { "type": "string", "description": "Project file, or a directory containing exactly one project" },
         "configuration": { "type": "string", "description": "Build configuration (default Debug)" },
-        "artifacts_path": { "type": "string", "description": "Directory for MSBuild output (obj); default: the one remembered from load_project; \"\" = none" },
+        "artifacts_path": { "type": "string", "description": "Directory for MSBuild output (obj); a relative path resolves against the server's working folder. Default: the one remembered from load_project; \"\" = none" },
         "overlays": { "type": "array", "description": "Files whose contents to replace for this check; a path that is not one of the project's source files is added as its last source file",
           "items": { "type": "object", "properties": {
               "path": { "type": "string", "description": "File path, absolute or relative to the project folder" },
@@ -374,7 +381,7 @@ let run () =
                 | true, v when v.ValueKind = JsonValueKind.Object ->
                     Some [ for p in v.EnumerateObject() -> p.Name, p.Value.ToString() ]
                 | _ -> None
-            front.LoadProject(path, argBool a "build" true, config, argStrOpt a "prelude", gcServer, argStrOpt a "artifacts_path", env)
+            front.LoadProject(path, argBool a "build" true, config, argStrOpt a "prelude", gcServer, argStrOpt a "artifacts_path", env, argBool a "return_references" false)
         | "bindings" -> front.Bindings ct
         | "check_project" ->
             let project = match str a "project" with "" -> "." | p -> p
@@ -383,7 +390,7 @@ let run () =
                 match a.TryGetProperty "overlays" with
                 | true, v when v.ValueKind = JsonValueKind.Array -> [ for o in v.EnumerateArray() -> str o "path", str o "content" ]
                 | _ -> []
-            front.CheckProject(project, config, argStrOpt a "artifacts_path", overlays)
+            front.CheckProject(project, config, argStrOpt a "artifacts_path", overlays, ct)
         | "profile" ->
             let mode = match str a "mode" with "alloc" -> Profiler.Alloc | _ -> Profiler.Cpu
             front.Profile(str a "code", mode, argInt a "top" 15, argInt a "timeout_seconds" 120, ct)

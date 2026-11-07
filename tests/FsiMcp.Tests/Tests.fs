@@ -235,15 +235,25 @@ let ``artifacts_path keeps build output out of the project folder`` () =
     s.Eval "SampleLib.Lib.version" |> ok |> has "val it: int = 1"
 
 [<Fact>]
-let ``load_project returns its references as structured content`` () =
+let ``load_project returns its references as structured content when asked`` () =
     let dir = copyFixture "SampleLib"
     use s = start ()
-    let r = s.LoadProject dir |> ok
+    let r = s.Call("load_project", {| path = dir; return_references = true |}) |> ok
     let refs = [ for e in r.Structured.Value.GetProperty("references").EnumerateArray() -> e.GetString() ]
     Assert.Contains(refs, fun p -> p.EndsWith "Newtonsoft.Json.dll")
     Assert.Contains(refs, fun p -> p.EndsWith "SampleLib.dll")
     Assert.All(refs, fun p -> Assert.True(File.Exists p, p))
     Assert.DoesNotContain(refs, fun p -> p.Contains(Path.Combine(Path.GetTempPath(), "fsi-mcp") + string Path.DirectorySeparatorChar))
+    Assert.True(File.Exists(r.Structured.Value.GetProperty("targetPath").GetString()))
+
+[<Fact>]
+let ``load_project without return_references and eval carry no structured content`` () =
+    let dir = copyFixture "SampleLib"
+    use s = start ()
+    let r = s.LoadProject dir |> ok
+    Assert.True(r.Structured.IsNone, "load_project returned structuredContent")
+    Assert.True((s.Eval "1 + 1" |> ok).Structured.IsNone, "eval returned structuredContent")
+    Assert.True((s.Eval "let broken: int = \"x\"" |> failed).Structured.IsNone, "a failed eval returned structuredContent")
 
 // ---------------------------------------------------------------- check_project
 
@@ -355,5 +365,48 @@ let ``check_project reports a failed MSBuild run as an error`` () =
     let proj = Path.Combine(dir, "SampleLib.fsproj")
     File.WriteAllText(proj, File.ReadAllText(proj).Replace("13.0.3", "999.0.0-nope"))
     use s = start ()
-    checkOn s dir [||] |> failed |> has "NU1102"
+    // NU1102 when the package source answers, NU1301 offline: either way the arguments could not be read
+    checkOn s dir [||] |> failed |> has "Could not get the compiler arguments"
 
+[<Fact>]
+let ``check_project uses the artifacts path remembered from load_project`` () =
+    let dir = copyFixture "SampleLib"
+    let artifacts = Path.Combine(dir, "..", "artifacts")
+    use s = start ()
+    s.Call("load_project", {| path = dir; artifacts_path = artifacts |}) |> ok |> ignore
+    let r = s.Call("check_project", {| project = dir; overlays = [| {| path = "Library.fs"; content = badLibrary |} |] |}) |> ok
+    Assert.Equal<(string * int * string) list>([ "Library.fs", 2, "FS0001" ], errors r |> List.map where)
+    Assert.False(Directory.Exists(Path.Combine(dir, "obj")), "obj/ under the project")
+    Assert.False(Directory.Exists(Path.Combine(dir, "bin")), "bin/ under the project")
+
+[<Fact>]
+let ``check_project rebuilds a referenced project changed since its last build`` () =
+    let root = copyFixtures [ "SampleLib"; "AppWithRef" ]
+    let app = Path.Combine(root, "AppWithRef")
+    use s = start ()
+    Assert.Empty(errors (checkOn s app [||] |> ok))
+    File.AppendAllText(Path.Combine(root, "SampleLib", "Library.fs"), "\nlet added = 1\n")
+    let r = checkOn s app [| {| path = "Program.fs"; content = "module AppWithRef.Program\nlet doubled = SampleLib.Lib.added * 2\n" |} |] |> ok
+    Assert.Empty(errors r)
+
+[<Fact>]
+let ``a cancelled check_project does not hold up later calls`` () =
+    let dir = copyFixture "SampleLib"
+    // Make check_project's MSBuild run take a minute.
+    File.WriteAllText(
+        Path.Combine(dir, "Directory.Build.targets"),
+        """<Project>
+  <Target Name="FsiMcpTestSlow" BeforeTargets="CoreCompile" Condition="'$(DesignTimeBuild)' == 'true'">
+    <Exec Condition="'$(OS)' != 'Windows_NT'" Command="sleep 60" />
+    <Exec Condition="'$(OS)' == 'Windows_NT'" Command="powershell -NoProfile -Command Start-Sleep 60" />
+  </Target>
+</Project>""")
+    use s = start ()
+    s.Eval "1" |> ok |> ignore // the session is up, so the eval below costs well under a second
+    let id = s.Send("tools/call", {| name = "check_project"; arguments = {| project = dir; artifacts_path = Path.Combine(dir, "..", "artifacts") |} |})
+    Threading.Thread.Sleep 2000 // inside the MSBuild run
+    s.Notify("notifications/cancelled", {| requestId = id; reason = "budget ran out" |})
+    let sw = Diagnostics.Stopwatch.StartNew()
+    s.Eval "1 + 1" |> ok |> has "val it: int = 2"
+    Assert.True(sw.Elapsed < TimeSpan.FromSeconds 10., $"eval waited {sw.Elapsed.TotalSeconds:F1}s behind a cancelled check")
+    Server.ToToolResult(s.Await(id, "check_project")) |> failed |> has "cancelled"
