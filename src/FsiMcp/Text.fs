@@ -30,6 +30,11 @@ let clip (max: int) (s: string) =
         let tail = max - head
         s.Substring(0, head) + $"\n... [{s.Length - max} chars clipped] ...\n" + s.Substring(s.Length - tail)
 
+let formatBytes (b: float) =
+    if b >= 1e9 then $"{b / 1e9:F1} GB"
+    elif b >= 1e6 then $"{b / 1e6:F1} MB"
+    else $"{b / 1e3:F0} KB"
+
 let str (e: JsonElement) (name: string) =
     if e.ValueKind <> JsonValueKind.Object then ""
     else

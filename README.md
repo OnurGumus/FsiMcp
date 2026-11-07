@@ -38,6 +38,9 @@ Prefer not to install? `dnx FsiMcp --yes` runs it straight from NuGet.
   doesn't.
 - **Light on context.** Types for bindings, values on request, long output clipped, and `printfn` never
   breaks the protocol.
+- **Profile in place.** `profile` runs an eval while recording it: top methods by CPU, or bytes allocated by
+  type and call site. Every slow eval also reports its time, allocations and GC counts.
+- **Your helpers, always there.** A `prelude` script is re-loaded into every fresh session.
 - **All of FSI.** `#r "nuget: ..."`, `#load`, `open`, everything `dotnet fsi` does.
 
 ## Tools
@@ -48,6 +51,8 @@ Prefer not to install? `dnx FsiMcp --yes` runs it straight from NuGet.
 | `eval` | run F#; state persists between calls |
 | `typecheck` | check code against the session without running it |
 | `reset` | fresh session, same project |
+| `profile` | run F# like `eval` and report where the CPU time or the allocations went |
+| `bindings` | list what the session has defined |
 
 [How it works](https://github.com/OnurGumus/FsiMcp/blob/main/docs/how-it-works.md) ·
 [Releasing](https://github.com/OnurGumus/FsiMcp/blob/main/RELEASING.md) · MIT licensed

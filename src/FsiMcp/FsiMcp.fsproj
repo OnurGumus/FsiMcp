@@ -8,7 +8,7 @@
     <RollForward>LatestMajor</RollForward>
     <DisableImplicitFSharpCoreReference>true</DisableImplicitFSharpCoreReference>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
 
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>fsi-mcp</ToolCommandName>
@@ -28,6 +28,7 @@
     <Compile Include="Text.fs" />
     <Compile Include="ProjectResolver.fs" />
     <Compile Include="Worker.fs" />
+    <Compile Include="Profiler.fs" />
     <Compile Include="Server.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
@@ -42,6 +43,9 @@
          at least the loaded project's version. -->
     <PackageReference Include="FSharp.Core" Version="10.1.401" />
     <PackageReference Include="FSharp.Compiler.Service" Version="43.12.401" />
+    <!-- Used by the SERVER process only (profile tool), never inside the worker's session. -->
+    <PackageReference Include="Microsoft.Diagnostics.NETCore.Client" Version="0.2.621003" />
+    <PackageReference Include="Microsoft.Diagnostics.Tracing.TraceEvent" Version="3.1.19" />
   </ItemGroup>
 
 </Project>

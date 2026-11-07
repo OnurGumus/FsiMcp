@@ -41,6 +41,31 @@ A failed build returns only the compiler errors and keeps the current session ru
 - `eval` takes `timeout_seconds` (default 120). On timeout or stack overflow the worker is replaced and the
   agent is told that bindings were lost.
 
+## Session options
+
+`load_project` takes options that stay in force for later loads, resets and timeout restarts until changed:
+
+- `prelude`: an `.fsx` file `#load`ed into every new session, with its module and its top-level `open`s
+  opened, so its helpers are usable unqualified. `""` removes it (also accepted by `reset`).
+- `gc_server`: run the session under Server GC, as ASP.NET apps do. Allocation-heavy code can run about twice
+  as fast under it, so time code under the GC it will really run with.
+- `env`: environment variables for the session process.
+
+## Profiling
+
+`profile` evaluates code like `eval` (same session) while the server records the worker over EventPipe;
+the diagnostics libraries live in the server process, never in the session that hosts your project.
+
+- `mode: "cpu"` (default) samples every thread about once a millisecond and counts only threads running
+  managed code, so idle pool threads do not drown the table. It reports methods by self time, and frames
+  from your own assemblies by total time. "(waiting for a garbage collection)" is time threads spent stopped
+  for the GC: a large share means allocations are the real cost.
+- `mode: "alloc"` records the runtime's allocation samples (about one per 100 KB) and reports bytes by type,
+  and by type at the nearest frame in your code, which is where to look.
+
+Slow (>= 0.5 s) or allocation-heavy (>= 100 MB) evals also end with `[time · bytes allocated · GC counts]`.
+Allocation volume is a much steadier A/B signal than time.
+
 ## Client configuration
 
 Install once with `dotnet tool install -g FsiMcp` (update with `dotnet tool update -g FsiMcp`), then:

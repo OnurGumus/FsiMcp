@@ -104,6 +104,9 @@ type private Session(refs: string list, outCap: Capture, errCap: Capture) =
         let background = outCap.Drain() + errCap.Drain()
         let mutable result = Unchecked.defaultof<Choice<FsiValue option, exn> * FSharpDiagnostic[]>
         let mutable hostError: exn = null
+        let gcBefore = [| GC.CollectionCount 0; GC.CollectionCount 1; GC.CollectionCount 2 |]
+        let allocBefore = GC.GetTotalAllocatedBytes true
+        let sw = Stopwatch.StartNew()
         // Deep recursion is common in F#; give evaluations a big stack.
         let t =
             Thread(
@@ -113,6 +116,9 @@ type private Session(refs: string list, outCap: Capture, errCap: Capture) =
                 256 * 1024 * 1024)
         t.Start()
         t.Join()
+        let elapsed = sw.Elapsed.TotalSeconds
+        let allocated = float (GC.GetTotalAllocatedBytes true - allocBefore)
+        let gcs = [| for g in 0..2 -> GC.CollectionCount g - gcBefore[g] |]
         let out = outCap.Drain()
         // With ShowDeclarationValues=false FSI also drops the trailing value when the interaction has
         // several statements (`printfn ..; xs` echoes only `val it: int list`). Put the value back.
@@ -159,9 +165,65 @@ type private Session(refs: string list, outCap: Capture, errCap: Capture) =
                         if not hasCompileError then add (formatException e)
                         true
                 add (formatDiagnostics diags)
+                // FSI commits an interaction all or nothing: a failure anywhere drops every
+                // binding, open and #load in it, which is easy to miss when it ran halfway.
+                if isError then
+                    add "Nothing from this eval was kept (bindings, opens, #load): fix it and send all of it again."
                 isError
+        // Cost of the eval itself, when it is worth reading: allocation volume is a far steadier
+        // A/B signal than time, and the GC counts say how much of the time was collection.
+        if elapsed >= 0.5 || allocated >= 100e6 then
+            add $"[{elapsed:F2} s · {formatBytes allocated} allocated · GCs gen0 {gcs[0]} / gen1 {gcs[1]} / gen2 {gcs[2]}]"
         let text = sb.ToString().TrimEnd()
         (if text = "" then "ok (no output)" else text), isError
+
+    /// What the session has bound so far: name and type.
+    member _.Bindings() : string * bool =
+        let ctx = FSharpDisplayContext.Empty.WithShortTypeNames true
+        match fsi.GetBoundValues() with
+        | [] -> "No bindings yet.", false
+        | values ->
+            values
+            |> List.map (fun b ->
+                let ty = try b.Value.FSharpType.Format ctx with _ -> b.Value.ReflectionType.Name
+                $"{b.Name}: {ty}")
+            |> String.concat "\n"
+            |> clip 6000,
+            false
+
+    /// `#load` a script, then open its module and replay its top-level `open`s in the session, so its
+    /// helpers are usable unqualified, as if typed in. Each step is its own interaction: a failing
+    /// open cannot roll back the load.
+    member this.LoadPrelude(path: string) : string =
+        let name = Path.GetFileName path
+        if not (File.Exists path) then $"prelude {name}: NOT FOUND at {path}"
+        else
+        let loadText, loadFailed = this.Eval($"#load @\"{path}\"")
+        if loadFailed then $"prelude {name}: FAILED to load\n{clip 3000 loadText}"
+        else
+        let lines = File.ReadAllLines path
+        let explicitModule =
+            lines
+            |> Array.tryPick (fun l ->
+                let t = l.Trim()
+                if t.StartsWith "module " && not (t.Contains "=") then Some(t.Substring(7).Trim()) else None)
+        let scriptModule =
+            match explicitModule with
+            | Some m -> m
+            | None ->
+                let n = Path.GetFileNameWithoutExtension path
+                let n = string (Char.ToUpperInvariant n[0]) + n.Substring 1
+                if n |> Seq.forall (fun c -> Char.IsLetterOrDigit c || c = '_') then n else $"``{n}``"
+        let opens =
+            lines
+            |> Array.choose (fun l -> if l.StartsWith "open " then Some(l.Substring(5).Trim()) else None)
+            |> List.ofArray
+        let results = (scriptModule :: opens) |> List.distinct |> List.map (fun o -> o, snd (this.Eval($"open {o}")))
+        let opened = results |> List.filter (snd >> not) |> List.map fst
+        let failed = results |> List.filter snd |> List.map fst
+        let failedText = if failed.IsEmpty then "" else "; could not open " + String.Join(", ", failed)
+        let openedText = String.Join(", ", opened)
+        $"prelude {name}: loaded; opened {openedText}{failedText}"
 
     member _.Typecheck(code: string) : string * bool =
         let parse, check, _ = fsi.ParseAndCheckInteraction code
@@ -214,9 +276,14 @@ let run () =
                 let s = Session(refs, outCap, errCap)
                 s.Eval "()" |> ignore // pay the compiler's JIT now, not on the first real eval
                 session <- Some s
-                reply ($"ready in {sw.Elapsed.TotalSeconds:F1}s", false)
+                let gc = if Runtime.GCSettings.IsServerGC then "server GC" else "workstation GC"
+                let ready = $"ready in {sw.Elapsed.TotalSeconds:F1}s (pid {Environment.ProcessId}, .NET {Environment.Version}, {gc})"
+                match str r "prelude" with
+                | "" -> reply (ready, false)
+                | path -> reply (ready + "\n" + s.LoadPrelude path, false)
             | "eval", Some s -> reply (s.Eval(str r "code"))
             | "typecheck", Some s -> reply (s.Typecheck(str r "code"))
+            | "bindings", Some s -> reply (s.Bindings())
             | op, _ -> reply ($"worker: bad op '{op}' (or no session)", true)
         with e -> reply ($"worker error: {formatException e}", true)
         line <- protocolIn.ReadLine()

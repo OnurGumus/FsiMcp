@@ -28,7 +28,7 @@ let private selfCommand () =
     if Path.GetFileNameWithoutExtension(pp).Equals("dotnet", StringComparison.OrdinalIgnoreCase) then pp, [ entry; "--worker" ]
     else pp, [ "--worker" ]
 
-type private WorkerProc(cwd: string, log: TextWriter) =
+type private WorkerProc(cwd: string, log: TextWriter, env: (string * string) list) =
     let p =
         let exe, args = selfCommand ()
         let psi = ProcessStartInfo(exe)
@@ -40,6 +40,8 @@ type private WorkerProc(cwd: string, log: TextWriter) =
         psi.StandardInputEncoding <- UTF8Encoding(false)
         psi.StandardOutputEncoding <- UTF8Encoding(false)
         psi.WorkingDirectory <- cwd
+        for k, v in env do
+            psi.Environment[k] <- v
         Process.Start psi
     // Only fatal runtime messages (e.g. "Stack overflow." + the repeating frame) reach the worker's real stderr.
     let crash = ResizeArray<string>()
@@ -78,6 +80,7 @@ type private WorkerProc(cwd: string, log: TextWriter) =
                 Some(str d.RootElement "text", d.RootElement.GetProperty("isError").GetBoolean())
 
     member _.Alive = not p.HasExited
+    member _.Pid = p.Id
 
     member _.Kill() =
         try
@@ -90,6 +93,14 @@ type private Front(log: TextWriter) =
     let mutable loaded: Resolved option = None
     let mutable snapshotDir: string option = None
     let mutable worker: WorkerProc option = None
+    // Remembered across load_project / reset / timeout restarts until changed.
+    let mutable prelude: string option = None
+    let mutable gcServer = false
+    let mutable extraEnv: (string * string) list = []
+    let mutable lastSurface: (string * string list) option = None
+
+    let workerEnv () =
+        (if gcServer then [ "DOTNET_gcServer", "1" ] else []) @ extraEnv
 
     let kill () =
         worker |> Option.iter (fun w -> w.Kill())
@@ -97,12 +108,13 @@ type private Front(log: TextWriter) =
 
     let spawn () : Result<string, string> =
         kill ()
-        let w = WorkerProc(cwd, log)
+        let w = WorkerProc(cwd, log, workerEnv ())
         let refs, native =
             match loaded with
             | Some r -> r.Managed, r.Native |> List.map (fun (a, b) -> [| a; b |])
             | None -> [], []
-        match w.Request({| op = "init"; refs = refs; native = native |}, TimeSpan.FromSeconds 120., CancellationToken.None) with
+        let init = {| op = "init"; refs = refs; native = native; prelude = Option.defaultValue "" prelude |}
+        match w.Request(init, TimeSpan.FromSeconds 120., CancellationToken.None) with
         | Some(text, false) ->
             worker <- Some w
             Ok text
@@ -148,7 +160,8 @@ type private Front(log: TextWriter) =
     member _.Typecheck(code: string, ct) =
         request {| op = "typecheck"; code = code |} (TimeSpan.FromSeconds 120.) ct
 
-    member _.Reset() =
+    member _.Reset(newPrelude: string option) =
+        newPrelude |> Option.iter (fun p -> prelude <- (if p = "" then None else Some(Path.GetFullPath p)))
         match spawn () with
         | Ok t ->
             let refs =
@@ -158,7 +171,10 @@ type private Front(log: TextWriter) =
             $"Fresh session ({t}{refs}).", false
         | Error e -> e, true
 
-    member _.LoadProject(path: string, build: bool, configuration: string) =
+    member _.LoadProject(path: string, build: bool, configuration: string, newPrelude: string option, newGcServer: bool option, newEnv: (string * string) list option) =
+        newPrelude |> Option.iter (fun p -> prelude <- (if p = "" then None else Some(Path.GetFullPath p)))
+        newGcServer |> Option.iter (fun g -> gcServer <- g)
+        newEnv |> Option.iter (fun e -> extraEnv <- e)
         let sw = Stopwatch.StartNew()
         match findProjectFile path |> Result.bind (fun p -> resolveProject p build configuration) with
         | Error e -> e, true // keep the current session alive
@@ -178,19 +194,51 @@ type private Front(log: TextWriter) =
                 let sb = StringBuilder()
                 let line (s: string) = sb.Append(s).Append('\n') |> ignore
                 let what = if build then $"{configuration} build + resolve" else "resolve (no build)"
-                line $"Loaded {Path.GetFileName r.ProjectFile}: {what} {resolveSecs:F1}s, session {t}. References {r.Managed.Length} assemblies, {r.Native.Length} native libs."
+                // `t` is the worker's ready line, then (with a prelude) the prelude's own line
+                let ready, preludeLine =
+                    match t.IndexOf '\n' with
+                    | -1 -> t, ""
+                    | i -> t.Substring(0, i), t.Substring(i + 1)
+                line $"Loaded {Path.GetFileName r.ProjectFile}: {what} {resolveSecs:F1}s, session {ready}. References {r.Managed.Length} assemblies, {r.Native.Length} native libs."
+                if preludeLine <> "" then line preludeLine
                 line $"Output: {r.TargetPath}"
                 for n in r.Notes do line n
-                line $"Public top-level types/modules in {Path.GetFileName r.TargetPath} ({surface.Length}):"
-                sb.Append(clip 3000 (String.Join("\n", surface))) |> ignore
-                sb.ToString(), false
+                match lastSurface with
+                | Some(p, s) when p = r.ProjectFile && s = surface ->
+                    line $"Public top-level types/modules: unchanged ({surface.Length})."
+                | _ ->
+                    line $"Public top-level types/modules in {Path.GetFileName r.TargetPath} ({surface.Length}):"
+                    sb.Append(clip 3000 (String.Join("\n", surface))) |> ignore
+                lastSurface <- Some(r.ProjectFile, surface)
+                sb.ToString().TrimEnd(), false
+
+    member _.Bindings(ct) = request {| op = "bindings" |} (TimeSpan.FromSeconds 60.) ct
+
+    /// Evaluate `code` while the server records the worker; append a CPU or allocation profile.
+    member _.Profile(code: string, mode: Profiler.Mode, top: int, timeoutSeconds: int, ct) =
+        match ensure () with
+        | Error e -> $"Could not start the F# session: {e}", true
+        | Ok w ->
+            let attempt =
+                try
+                    Ok(Profiler.record w.Pid mode (fun () -> request {| op = "eval"; code = code |} (TimeSpan.FromSeconds(float timeoutSeconds)) ct))
+                with e ->
+                    Error $"Could not attach the profiler to the worker (pid {w.Pid}): {e.Message}"
+            match attempt with
+            | Error e -> e, true
+            | Ok((text, isError), trace) ->
+                let report =
+                    try Profiler.analyze mode trace top
+                    with e -> $"(could not analyse the trace: {e.Message})"
+                let label = match mode with Profiler.Cpu -> "cpu" | Profiler.Alloc -> "alloc"
+                $"{text}\n\n--- profile ({label}) ---\n{report}", isError
 
 let private toolsJson =
     JsonDocument.Parse(
         """
 [
   { "name": "eval",
-    "description": "Evaluate F# code in a persistent F# Interactive session (like dotnet fsi). Bindings, types, opens and #r persist across calls until reset/load_project. Returns printed output, `val x: T` for each binding (types only; evaluate an expression to see a value), `val it: T = value` for a trailing expression, and compiler diagnostics. Values print with limits and long output is clipped: project the fields you need (List.map) instead of printing large records. Expensive results stay in memory, so bind them once and inspect them in later calls. Do not end code with ;;",
+    "description": "Evaluate F# code in a persistent F# Interactive session (like dotnet fsi). Bindings, types, opens and #r persist across calls until reset/load_project. Returns printed output, `val x: T` for each binding (types only; evaluate an expression to see a value), `val it: T = value` for a trailing expression, and compiler diagnostics; slow or allocation-heavy evals end with a [time · bytes allocated · GC counts] line. Values print with limits and long output is clipped: project the fields you need (List.map) instead of printing large records. Expensive results stay in memory, so bind them once and inspect them in later calls. An eval that fails keeps NOTHING from it (bindings, opens, #load), so put a #load in its own eval. Do not end code with ;;",
     "inputSchema": { "type": "object", "properties": {
         "code": { "type": "string", "description": "F# code: declarations, expressions, #r/#load/open directives" },
         "timeout_seconds": { "type": "integer", "description": "Kill the session after this many seconds (default 120); state is lost" } },
@@ -199,14 +247,29 @@ let private toolsJson =
     "description": "Type-check F# code against the current session (loaded project + earlier bindings) WITHOUT running it or binding anything. Returns inferred signatures, or compiler diagnostics.",
     "inputSchema": { "type": "object", "properties": { "code": { "type": "string" } }, "required": ["code"] } },
   { "name": "reset",
-    "description": "Discard all session state (bindings, opens, loaded assemblies) by starting a fresh session process; keeps the references from the last load_project without rebuilding.",
+    "description": "Discard all session state (bindings, opens, loaded assemblies) by starting a fresh session process; keeps the references and prelude from the last load_project without rebuilding.",
+    "inputSchema": { "type": "object", "properties": {
+        "prelude": { "type": "string", "description": "Change the prelude script (see load_project); \"\" removes it" } } } },
+  { "name": "bindings",
+    "description": "List what the session has bound so far (name: type).",
     "inputSchema": { "type": "object", "properties": {} } },
+  { "name": "profile",
+    "description": "Evaluate F# code like eval (same session, bindings persist) while recording a profile of it: mode cpu (default) = top methods by self time plus your code by total time, counting only threads running managed code; mode alloc = bytes allocated by type and by the nearest frame in your code. Use it to find where time or garbage goes before optimising.",
+    "inputSchema": { "type": "object", "properties": {
+        "code": { "type": "string", "description": "F# code to evaluate and profile" },
+        "mode": { "type": "string", "enum": ["cpu", "alloc"], "description": "cpu (default) or alloc" },
+        "top": { "type": "integer", "description": "Rows per table (default 15)" },
+        "timeout_seconds": { "type": "integer", "description": "As for eval (default 120)" } },
+      "required": ["code"] } },
   { "name": "load_project",
-    "description": "Build a .fsproj/.csproj and start a fresh session referencing its output assembly and full runtime closure (NuGet packages, project references, native libs, ASP.NET Core shared framework), so its modules can be opened and called from eval. Call again after editing the project's source: the new session sees the rebuilt code. Lists the assembly's public top-level modules.",
+    "description": "Build a .fsproj/.csproj and start a fresh session referencing its output assembly and full runtime closure (NuGet packages, project references, native libs, ASP.NET Core shared framework), so its modules can be opened and called from eval. Call again after editing the project's source: the new session sees the rebuilt code. Lists the assembly's public top-level modules (again only when they change).",
     "inputSchema": { "type": "object", "properties": {
         "path": { "type": "string", "description": "Project file, or a directory containing exactly one project" },
         "build": { "type": "boolean", "description": "Build first (default true). false = use the existing bin output" },
-        "configuration": { "type": "string", "description": "Build configuration (default Debug)" } },
+        "configuration": { "type": "string", "description": "Build configuration (default Debug)" },
+        "prelude": { "type": "string", "description": "An .fsx script to #load into every new session (after this load, reset and timeout restarts), with its module and top-level opens opened; \"\" removes it. Remembered until changed" },
+        "gc_server": { "type": "boolean", "description": "Run the session with Server GC (like ASP.NET apps) instead of workstation GC; matters for timing. Remembered until changed" },
+        "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Environment variables for the session process. Remembered until changed" } },
       "required": ["path"] } }
 ]
 """
@@ -215,6 +278,14 @@ let private toolsJson =
 
 let private instructions =
     "Persistent F# Interactive (FSI) session. Use load_project to make a project's code available (and again after editing it), then eval to run F# against it; state persists across eval calls. Use typecheck to check code without executing it. Prefer this over writing throwaway console projects or scripts for probing F# code."
+
+/// A string argument that was given (possibly ""), or None when absent.
+let private argStrOpt (a: JsonElement) (name: string) =
+    if a.ValueKind <> JsonValueKind.Object then None
+    else
+        match a.TryGetProperty name with
+        | true, v when v.ValueKind = JsonValueKind.String -> Some(v.GetString())
+        | _ -> None
 
 /// Server entry point: serve MCP on stdin/stdout until stdin closes.
 let run () =
@@ -245,11 +316,25 @@ let run () =
         match name with
         | "eval" -> front.Eval(str a "code", argInt a "timeout_seconds" 120, ct)
         | "typecheck" -> front.Typecheck(str a "code", ct)
-        | "reset" -> front.Reset()
+        | "reset" -> front.Reset(argStrOpt a "prelude")
         | "load_project" ->
             let path = match str a "path" with "" -> "." | p -> p
             let config = match str a "configuration" with "" -> "Debug" | c -> c
-            front.LoadProject(path, argBool a "build" true, config)
+            let gcServer =
+                match a.TryGetProperty "gc_server" with
+                | true, v when v.ValueKind = JsonValueKind.True -> Some true
+                | true, v when v.ValueKind = JsonValueKind.False -> Some false
+                | _ -> None
+            let env =
+                match a.TryGetProperty "env" with
+                | true, v when v.ValueKind = JsonValueKind.Object ->
+                    Some [ for p in v.EnumerateObject() -> p.Name, p.Value.ToString() ]
+                | _ -> None
+            front.LoadProject(path, argBool a "build" true, config, argStrOpt a "prelude", gcServer, env)
+        | "bindings" -> front.Bindings ct
+        | "profile" ->
+            let mode = match str a "mode" with "alloc" -> Profiler.Alloc | _ -> Profiler.Cpu
+            front.Profile(str a "code", mode, argInt a "top" 15, argInt a "timeout_seconds" 120, ct)
         | other -> $"Unknown tool: {other}", true
 
     let handle (line: string) =

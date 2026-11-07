@@ -32,7 +32,7 @@ let ``initialize and tools/list describe the server`` () =
     Assert.Equal("2025-06-18", init.GetProperty("protocolVersion").GetString())
     let tools = s.Request("tools/list", (obj ()))
     let names = [ for t in tools.GetProperty("tools").EnumerateArray() -> t.GetProperty("name").GetString() ]
-    Assert.Equal<string list>([ "eval"; "typecheck"; "reset"; "load_project" ], names)
+    Assert.Equal<string list>([ "eval"; "typecheck"; "reset"; "bindings"; "profile"; "load_project" ], names)
 
 // ---------------------------------------------------------------- eval
 
@@ -152,3 +152,72 @@ let ``a failed build keeps the previous session`` () =
 let ``load_project reports a missing path`` () =
     use s = start ()
     s.LoadProject "does/not/exist" |> failed |> has "Not found"
+
+// ---------------------------------------------------------------- 0.2: prelude, cost line, options, bindings, profile
+
+let preludePath = Path.Combine(fixturesDir, "prelude", "helpers.fsx")
+
+[<Fact>]
+let ``a prelude is loaded after every load, reset and restart`` () =
+    let dir = copyFixture "SampleLib"
+    use s = start ()
+    s.Call("load_project", {| path = dir; prelude = preludePath |}) |> ok |> has "prelude helpers.fsx: loaded; opened Helpers, System.Text"
+    s.Eval "greet \"a\", StringBuilder(\"sb\").ToString()" |> ok |> has "(\"hi a\", \"sb\")"
+    s.Reset() |> ok |> has "prelude helpers.fsx: loaded"
+    s.Eval "greet \"b\"" |> ok |> has "\"hi b\""
+    s.Eval("while true do ()", 2) |> failed |> has "prelude helpers.fsx: loaded"
+    s.Eval "greet \"c\"" |> ok |> has "\"hi c\""
+    s.Call("reset", {| prelude = "" |}) |> ok |> lacks "prelude"
+    s.Eval "greet \"d\"" |> failed |> has "FS0039"
+
+[<Fact>]
+let ``slow or allocating evals report their cost`` () =
+    use s = start ()
+    let r = s.Eval "Array.init 3_000_000 (fun i -> string i) |> Array.length" |> ok
+    has "allocated" r
+    has "GCs gen0" r
+    s.Eval "1 + 1" |> ok |> lacks "allocated"
+
+[<Fact>]
+let ``a failed eval says nothing from it was kept`` () =
+    use s = start ()
+    s.Eval "let a = 1\nlet b: int = \"x\"" |> failed |> has "Nothing from this eval was kept"
+    s.Eval "a" |> failed |> has "FS0039"
+
+[<Fact>]
+let ``gc_server and env reach the session process`` () =
+    let dir = copyFixture "SampleLib"
+    use s = start ()
+    s.Call("load_project", {| path = dir; gc_server = true; env = {| FSIMCP_TEST = "yes" |} |}) |> ok |> has "server GC"
+    s.Eval "System.Runtime.GCSettings.IsServerGC, System.Environment.GetEnvironmentVariable \"FSIMCP_TEST\"" |> ok |> has "(true, \"yes\")"
+
+[<Fact>]
+let ``bindings lists names and types`` () =
+    use s = start ()
+    s.Eval "let count = 3\nlet label = \"x\"" |> ok |> ignore
+    let r = s.Call("bindings", (obj ())) |> ok
+    has "count: int" r
+    has "label: string" r
+
+[<Fact>]
+let ``profile cpu names the hot function`` () =
+    use s = start ()
+    s.Eval "let rec fib n = if n < 2 then n else fib (n - 1) + fib (n - 2)" |> ok |> ignore
+    let r = s.Call("profile", {| code = "fib 34" |}) |> ok
+    has "val it: int = 5702887" r
+    has "--- profile (cpu) ---" r
+    has "fib" r
+
+[<Fact>]
+let ``profile alloc reports what was allocated`` () =
+    use s = start ()
+    let r = s.Call("profile", {| code = "[ for i in 1 .. 2_000_000 -> string i ] |> List.length"; mode = "alloc" |}) |> ok
+    has "--- profile (alloc) ---" r
+    has "System.String" r
+
+[<Fact>]
+let ``the module list repeats only when it changes`` () =
+    let dir = copyFixture "SampleLib"
+    use s = start ()
+    s.LoadProject dir |> ok |> has "SampleLib.Lib"
+    s.LoadProject dir |> ok |> has "unchanged (1)"
