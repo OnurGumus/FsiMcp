@@ -299,6 +299,31 @@ type private Front(log: TextWriter) =
 
     member _.Bindings(ct) = request {| op = "bindings" |} (TimeSpan.FromSeconds 60.) ct |> plain
 
+    /// Time and allocations per call of an expression, measured in the worker.
+    member _.Measure(expr: string, iterations: int, timeoutSeconds: int, ct) =
+        let (text, isError), root, _ =
+            requestFull {| op = "measure"; expr = expr; iterations = iterations |} (TimeSpan.FromSeconds(float timeoutSeconds)) ct
+        match root |> Option.bind (fun r -> match r.TryGetProperty "measure" with | true, m -> Some m | _ -> None) with
+        | None -> plain (text, isError)
+        | Some m ->
+            let num (name: string) = m.GetProperty(name).GetDouble()
+            let count (name: string) = m.GetProperty(name).GetInt32()
+            { Text = text
+              IsError = isError
+              Structured =
+                Some(
+                    box
+                        {| medianNs = num "medianNs"
+                           p90Ns = num "p90Ns"
+                           bytesPerCall = num "bytesPerCall"
+                           gen0 = count "gen0"
+                           gen1 = count "gen1"
+                           gen2 = count "gen2"
+                           iterations = count "iterations"
+                           gcServer = m.GetProperty("gcServer").GetBoolean()
+                           note = "Allocations on other threads (async, Task, Parallel) are not counted." |}
+                ) }
+
     /// Evaluate `code` while the server records the worker; append a CPU or allocation profile.
     member _.Profile(code: string, mode: Profiler.Mode, top: int, timeoutSeconds: int, ct) =
         match ensure () with
@@ -370,7 +395,14 @@ let private toolsJson =
               "path": { "type": "string", "description": "File path, absolute or relative to the project folder" },
               "content": { "type": "string", "description": "The file's full contents" } },
             "required": ["path", "content"] } } },
-      "required": ["project"] } }
+      "required": ["project"] } },
+  { "name": "measure",
+    "description": "Time and allocations per call of an F# expression, for comparing small code: it is compiled once, warmed up, then run many times. Bindings from the session are available; nothing new is bound.",
+    "inputSchema": { "type": "object", "properties": {
+        "expr": { "type": "string", "description": "An F# expression that computes a value (not a function), e.g. List.init 100 id |> List.sum" },
+        "iterations": { "type": "integer", "description": "Number of calls, 10 to 1000000 (default: as many as fit in about 1 s)" },
+        "timeout_seconds": { "type": "integer", "description": "Kill the session after this many seconds (default 60); state is lost" } },
+      "required": ["expr"] } }
 ]
 """
     )
@@ -443,6 +475,7 @@ let run () =
         | "profile" ->
             let mode = match str a "mode" with "alloc" -> Profiler.Alloc | _ -> Profiler.Cpu
             front.Profile(str a "code", mode, argInt a "top" 15, argInt a "timeout_seconds" 120, ct)
+        | "measure" -> front.Measure(str a "expr", argInt a "iterations" 0, argInt a "timeout_seconds" 60, ct)
         | other -> plain ($"Unknown tool: {other}", true)
 
     let handle (line: string) =

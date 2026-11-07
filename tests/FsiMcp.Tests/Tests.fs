@@ -33,7 +33,7 @@ let ``initialize and tools/list describe the server`` () =
     Assert.Equal("2025-06-18", init.GetProperty("protocolVersion").GetString())
     let tools = s.Request("tools/list", (obj ()))
     let names = [ for t in tools.GetProperty("tools").EnumerateArray() -> t.GetProperty("name").GetString() ]
-    Assert.Equal<string list>([ "eval"; "typecheck"; "reset"; "bindings"; "profile"; "load_project"; "check_project" ], names)
+    Assert.Equal<string list>([ "eval"; "typecheck"; "reset"; "bindings"; "profile"; "load_project"; "check_project"; "measure" ], names)
 
 // ---------------------------------------------------------------- eval
 
@@ -327,6 +327,92 @@ let ``load_project structured: no prelude is null`` () =
     use s = start ()
     let r = s.Call("load_project", {| path = dir; return_references = true |}) |> ok
     Assert.Equal(System.Text.Json.JsonValueKind.Null, r.Structured.Value.GetProperty("prelude").ValueKind)
+
+// ---------------------------------------------------------------- measure
+
+let measure (s: Server) (expr: string) = s.Call("measure", {| expr = expr |})
+
+let bytesPerCall (r: ToolResult) = r.Structured.Value.GetProperty("bytesPerCall").GetDouble()
+
+[<Fact>]
+let ``measure: a list costs more than an array`` () =
+    use s = start ()
+    let list = measure s "List.init 100 id |> List.sum" |> ok
+    let array = measure s "Array.init 100 id |> Array.sum" |> ok
+    has " per call · " list
+    has " B per call · GCs gen0 " list
+    Assert.True(bytesPerCall list > bytesPerCall array, $"list {bytesPerCall list} B, array {bytesPerCall array} B")
+    let sc = list.Structured.Value
+    Assert.True(sc.GetProperty("medianNs").GetDouble() > 0.0)
+    Assert.True(sc.GetProperty("p90Ns").GetDouble() >= sc.GetProperty("medianNs").GetDouble())
+    Assert.True(sc.GetProperty("iterations").GetInt32() >= 10)
+    Assert.False(sc.GetProperty("gcServer").GetBoolean())
+
+[<Fact>]
+let ``measure: no allocation reads 0 B`` () =
+    use s = start ()
+    let r = measure s "1 + 1" |> ok
+    Assert.True(bytesPerCall r < 1.0, $"1 + 1 allocated {bytesPerCall r} B per call\n{r.Text}")
+
+[<Fact>]
+let ``measure: iterations sets the number of calls`` () =
+    use s = start ()
+    let r = s.Call("measure", {| expr = "Array.zeroCreate<int> 10"; iterations = 500 |}) |> ok
+    Assert.Equal(500, r.Structured.Value.GetProperty("iterations").GetInt32())
+    has "over 500 calls" r
+
+[<Fact>]
+let ``measure: session bindings are usable`` () =
+    use s = start ()
+    s.Eval "let n = 50" |> ok |> ignore
+    measure s "List.init n id" |> ok |> has "per call"
+
+[<Fact>]
+let ``measure: a throwing expression is an error and keeps the session`` () =
+    use s = start ()
+    s.Eval "let n = 50" |> ok |> ignore
+    measure s "failwith \"boom\"" |> failed |> has "boom"
+    s.Eval "n" |> ok |> has "val it: int = 50"
+
+[<Fact>]
+let ``measure: a compile error is an error with the diagnostics`` () =
+    use s = start ()
+    measure s "undefinedThing + 1" |> failed |> has "(1,1): error FS0039" // positions are the expression's own
+    measure s "1 +\n  undefinedThing" |> failed |> has "(2,3): error FS0039"
+
+[<Fact>]
+let ``measure: a function value is refused`` () =
+    use s = start ()
+    measure s "fun x -> x + 1" |> failed |> has "not a function"
+    measure s "id" |> failed |> has "not a function"
+
+[<Fact>]
+let ``measure: a generic result is measured`` () =
+    use s = start ()
+    measure s "[]" |> ok |> has "per call"
+
+[<Fact>]
+let ``measure: a timeout restarts the session`` () =
+    use s = start ()
+    s.Call("measure", {| expr = "System.Threading.Thread.Sleep 1000"; timeout_seconds = 2 |}) |> failed |> has "timed out"
+    s.Eval "1 + 1" |> ok |> has "val it: int = 2"
+
+[<Fact>]
+let ``measure: the note says other threads are not counted`` () =
+    use s = start ()
+    let r = measure s "1 + 1" |> ok
+    Assert.Equal("Allocations on other threads (async, Task, Parallel) are not counted.", r.Structured.Value.GetProperty("note").GetString())
+
+[<Fact>]
+let ``measure: nothing new is bound`` () =
+    use s = start ()
+    s.Eval "let kept = 7\nkept + 1" |> ok |> ignore
+    measure s "printfn \"noise\"; kept" |> ok |> lacks "noise"
+    s.Call("bindings", (obj ())) |> ok |> lacks "__fsimcp_measure_"
+    let r = s.Eval "it" |> ok
+    has "val it: int = 8" r
+    lacks "noise" r
+    lacks "__fsimcp_measure_" r
 
 // ---------------------------------------------------------------- check_project
 

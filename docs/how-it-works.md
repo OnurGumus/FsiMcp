@@ -43,6 +43,7 @@ A failed build returns only the compiler errors and keeps the current session ru
 - `check_project` results also carry `structuredContent` for clients that read it: its `diagnostics` (path,
   line, column, severity, code, message). `load_project` adds `structuredContent` with its `references` and
   `targetPath` only when called with `return_references: true`; otherwise its result is text only, as in 0.2.0.
+  `measure` always returns `structuredContent` (see Measuring).
 
 ## Session options
 
@@ -92,6 +93,30 @@ the diagnostics libraries live in the server process, never in the session that 
 
 Slow (>= 0.5 s) or allocation-heavy (>= 100 MB) evals also end with `[time · bytes allocated · GC counts]`.
 Allocation volume is a much steadier A/B signal than time.
+
+## Measuring
+
+`measure` gives the time and the bytes allocated per call of an expression, for comparing small code
+(a list against an array, one parser against another):
+
+1. The expression is bound in the session as a thunk, `fun () -> (expr)`, under a hidden name
+   (`__fsimcp_measure_<n>`, never listed by `bindings`), so it is compiled once and sees the session's
+   bindings. A compile error is returned with positions in the expression itself, and nothing is kept.
+   An expression whose value is a function is refused: apply it first.
+2. It is called 30 times, then the worker sleeps 150 ms so tiered compilation can promote the hot code,
+   then it is called 30 more times.
+3. The batch size doubles until a batch takes at least 1 ms.
+4. Batches run until `iterations` calls (10 to 1,000,000), or by default until about 1 s has passed
+   (at least 10 calls, at most 1,000,000). Each batch's time per call is recorded; the result is the
+   median and the 90th percentile over batches.
+5. Bytes per call are `GC.GetAllocatedBytesForCurrentThread` before and after the loop, divided by the
+   calls; GC counts are for the whole loop. The results are kept (`GC.KeepAlive`), so the work is not
+   optimised away.
+
+The loop runs on one thread, so allocations made on other threads (`async`, `Task`, `Parallel`) are not
+counted; the structured result says so in its `note`. Its `gcServer` says which GC the numbers were taken
+under (see `gc_server`). Anything the expression prints is dropped. `timeout_seconds` (default 60) works as
+for `eval`.
 
 ## Client configuration
 

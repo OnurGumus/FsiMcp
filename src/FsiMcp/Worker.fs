@@ -90,6 +90,98 @@ type private CompactConfig(inner: FsiEvaluationSessionHostConfig) =
     override _.EventLoopScheduleRestart() = inner.EventLoopScheduleRestart()
     override _.UseFsiAuxLib = inner.UseFsiAuxLib
 
+/// What `measure` found, per call.
+type private Measurement =
+    { MedianNs: float
+      P90Ns: float
+      BytesPerCall: float
+      Gen0: int
+      Gen1: int
+      Gen2: int
+      Calls: int }
+
+/// The measuring loop, compiled per result type so calling the thunk never boxes or allocates.
+type private Bench =
+    /// Call `f` n times; the last result is returned so the caller can keep it alive.
+    static member Calls<'T>(f: unit -> 'T, n: int) : 'T =
+        let mutable last = Unchecked.defaultof<'T>
+        for _ in 1..n do
+            let r = f ()
+            // A value type is kept in a local (boxing it would allocate on every call).
+            if typeof<'T>.IsValueType then last <- r else GC.KeepAlive(box r)
+        last
+
+    /// Warm up, pick a batch size of at least 1 ms, then run batches until `iterations` calls
+    /// (0 = as many as fit in about 1 s, at least 10). Call it on the thread whose allocations count.
+    static member Run<'T>(f: unit -> 'T, iterations: int) : Measurement =
+        let mutable last = Bench.Calls(f, 30)
+        Thread.Sleep 150 // let tiered compilation promote the hot code to tier 1
+        last <- Bench.Calls(f, 30)
+        let auto = iterations <= 0
+        let target = if auto then 1_000_000 else min 1_000_000 (max 10 iterations)
+        let oneMs = Stopwatch.Frequency / 1000L
+        let mutable batch = 1
+        let mutable sizing = true
+        while sizing do
+            let t0 = Stopwatch.GetTimestamp()
+            last <- Bench.Calls(f, batch)
+            if Stopwatch.GetTimestamp() - t0 >= oneMs || batch >= target then sizing <- false
+            else batch <- min target (batch * 2)
+        let perCallNs = Array.zeroCreate<float> ((target + batch - 1) / batch)
+        let tickNs = 1e9 / float Stopwatch.Frequency
+        let gc0, gc1, gc2 = GC.CollectionCount 0, GC.CollectionCount 1, GC.CollectionCount 2
+        let bytesBefore = GC.GetAllocatedBytesForCurrentThread()
+        let start = Stopwatch.GetTimestamp()
+        let mutable calls = 0
+        let mutable batches = 0
+        let mutable running = true
+        while running do
+            let n = min batch (target - calls)
+            let t0 = Stopwatch.GetTimestamp()
+            last <- Bench.Calls(f, n)
+            let t1 = Stopwatch.GetTimestamp()
+            perCallNs[batches] <- float (t1 - t0) * tickNs / float n
+            batches <- batches + 1
+            calls <- calls + n
+            running <- calls < target && (not auto || calls < 10 || t1 - start < Stopwatch.Frequency)
+        let bytes = GC.GetAllocatedBytesForCurrentThread() - bytesBefore
+        let gens = GC.CollectionCount 0 - gc0, GC.CollectionCount 1 - gc1, GC.CollectionCount 2 - gc2
+        GC.KeepAlive(box last)
+        let sorted = Array.sub perCallNs 0 batches |> Array.sort
+        let median =
+            if batches % 2 = 1 then sorted[batches / 2] else (sorted[batches / 2 - 1] + sorted[batches / 2]) / 2.0
+        let p90 = sorted[max 0 (int (ceil (0.9 * float batches)) - 1)]
+        let g0, g1, g2 = gens
+        { MedianNs = median
+          P90Ns = p90
+          BytesPerCall = float bytes / float calls
+          Gen0 = g0
+          Gen1 = g1
+          Gen2 = g2
+          Calls = calls }
+
+/// A time per call with its unit (ns, µs, ms, s), to 3 significant digits.
+let private formatNs (ns: float) =
+    let rounded =
+        if ns <= 0.0 then 0.0
+        else
+            let scale = 10.0 ** (3.0 - floor (log10 ns) - 1.0)
+            Math.Round(ns * scale) / scale
+    let v, unit =
+        if rounded < 1e3 then rounded, "ns"
+        elif rounded < 1e6 then rounded / 1e3, "µs"
+        elif rounded < 1e9 then rounded / 1e6, "ms"
+        else rounded / 1e9, "s"
+    let digits = if v >= 100.0 then "F0" elif v >= 10.0 then "F1" else "F2"
+    v.ToString(digits, Globalization.CultureInfo.InvariantCulture) + " " + unit
+
+let private formatBytesPerCall (b: float) =
+    let s = b.ToString((if b >= 100.0 then "F0" else "0.##"), Globalization.CultureInfo.InvariantCulture)
+    if s = "-0" then "0" else s
+
+/// Prefix of the bindings `measure` makes; `bindings` never lists them.
+let private measurePrefix = "__fsimcp_measure_"
+
 type private Session(refs: string list, outCap: Capture, errCap: Capture) =
     let fsi =
         let argv =
@@ -99,6 +191,17 @@ type private Session(refs: string list, outCap: Capture, errCap: Capture) =
     do
         outCap.Drain() |> ignore
         errCap.Drain() |> ignore
+    let mutable measures = 0
+
+    /// Run `f` on a fresh thread with a big stack (deep recursion is common in F#); rethrows its exception.
+    let onBigStack (f: unit -> 'T) : 'T =
+        let mutable result = Unchecked.defaultof<'T>
+        let mutable error: exn = null
+        let t = Thread(ThreadStart(fun () -> try result <- f () with e -> error <- e), 256 * 1024 * 1024)
+        t.Start()
+        t.Join()
+        if not (isNull error) then Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(error).Throw()
+        result
 
     member this.Eval(code: string) : string * bool =
         let text, isError, _ = this.EvalWithStats code
@@ -182,10 +285,91 @@ type private Session(refs: string list, outCap: Capture, errCap: Capture) =
         let text = sb.ToString().TrimEnd()
         (if text = "" then "ok (no output)" else text), isError, (elapsed * 1000.0, allocated, gcs)
 
+    /// Time and allocations per call of `expr`: bind it as a thunk under a hidden name, then run it many
+    /// times on one thread. Prints nothing to the session's output; output from before it is kept for the
+    /// next eval. Returns the text, the error flag, and the measurement (None on error).
+    member _.Measure(expr: string, iterations: int) : string * bool * Measurement option =
+        let pendingOut = outCap.Drain()
+        let pendingErr = errCap.Drain()
+        measures <- measures + 1
+        let name = measurePrefix + string measures
+        // The expression starts on line 4, indented by 12 columns; diagnostics are mapped back to it.
+        let body =
+            expr.Replace("\r\n", "\n").TrimEnd().Split('\n') |> Array.map (fun l -> "            " + l) |> String.concat "\n"
+        let thunk (binding: string) (suffix: string) =
+            $"{binding} {name} =\n    fun () ->\n        (\n{body}\n        ){suffix}"
+        let diagnostics (diags: FSharpDiagnostic[]) =
+            diags
+            |> Array.filter (fun d -> d.Severity = FSharpDiagnosticSeverity.Error)
+            |> Array.distinctBy (fun d -> d.StartLine, d.StartColumn, d.ErrorNumber, d.Message)
+            |> Array.map (fun d ->
+                let line, col =
+                    if d.StartLine >= 4 && d.StartColumn >= 12 then d.StartLine - 3, d.StartColumn - 11
+                    else d.StartLine, d.StartColumn + 1
+                $"({line},{col}): error {d.ErrorNumberText}: {d.Message}")
+            |> String.concat "\n"
+        let fail (text: string) = text, true, None
+        let outcome =
+            try
+                // Type-check the thunk first (nothing runs or is bound): its errors, and its result type.
+                let parse, check, _ = fsi.ParseAndCheckInteraction(thunk "let" "")
+                let shown = diagnostics (Array.append parse.Diagnostics check.Diagnostics)
+                if shown <> "" then fail shown else
+                let resultType =
+                    try
+                        check.PartialAssemblySignature.Entities
+                        |> Seq.collect (fun e -> e.MembersFunctionsAndValues)
+                        |> Seq.tryFind (fun m -> m.DisplayName = name && m.FullType.IsFunctionType)
+                        |> Option.map (fun m -> m.FullType.GenericArguments[1])
+                    with _ -> None
+                let isFunction (t: FSharpType) = (if t.IsAbbreviation then t.StripAbbreviations() else t).IsFunctionType
+                match resultType with
+                | Some t when isFunction t ->
+                    let shown = t.Format(FSharpDisplayContext.Empty.WithShortTypeNames true)
+                    fail $"measure needs an expression that computes a value, not a function (this one has type {shown}). Apply it to its arguments, e.g. `f 42`."
+                | _ ->
+                // Bind it for real. `mutable` makes FSI keep the closure in a field, which GetBoundValues
+                // can read (a plain `let f = fun () -> ...` compiles to a method). A generic result
+                // (`failwith ..`, `[]`) cannot be a mutable's type: it is measured as obj instead.
+                let eval code = onBigStack (fun () -> fsi.EvalInteractionNonThrowing code)
+                let evaluated =
+                    match eval (thunk "let mutable" "") with
+                    | Choice2Of2 _, diags when diags |> Array.exists (fun d -> d.ErrorNumber = 30) -> eval (thunk "let mutable" " :> obj")
+                    | r -> r
+                match evaluated with
+                | Choice2Of2 e, diags ->
+                    let shown = diagnostics diags
+                    fail (if shown <> "" then shown else formatException e)
+                | Choice1Of2 _, _ ->
+                let rec thunkType (t: Type) =
+                    if isNull t then None
+                    elif t.IsGenericType && t.GetGenericTypeDefinition() = typedefof<unit -> unit> then Some t
+                    else thunkType t.BaseType
+                match fsi.GetBoundValues() |> List.tryFind (fun b -> b.Name = name) with
+                | None -> fail "measure could not get the compiled expression from the session."
+                | Some b ->
+                match thunkType b.Value.ReflectionType with
+                | None -> fail $"measure could not call the compiled expression (type {b.Value.ReflectionType})."
+                | Some t ->
+                let run =
+                    typeof<Bench>.GetMethod("Run", BindingFlags.Static ||| BindingFlags.Public ||| BindingFlags.NonPublic)
+                        .MakeGenericMethod(t.GetGenericArguments()[1])
+                let m = onBigStack (fun () -> run.Invoke(null, [| b.Value.ReflectionValue; box iterations |]) :?> Measurement)
+                let text =
+                    $"{formatNs m.MedianNs} per call · {formatBytesPerCall m.BytesPerCall} B per call · GCs gen0 {m.Gen0} / gen1 {m.Gen1} / gen2 {m.Gen2} over {m.Calls} calls"
+                text, false, Some m
+            with e -> formatException e, true, None
+        // Whatever the expression printed is dropped; output from before this call waits for the next eval.
+        outCap.Drain() |> ignore
+        errCap.Drain() |> ignore
+        outCap.Write pendingOut
+        errCap.Write pendingErr
+        outcome
+
     /// What the session has bound so far: name and type.
     member _.Bindings() : string * bool =
         let ctx = FSharpDisplayContext.Empty.WithShortTypeNames true
-        match fsi.GetBoundValues() with
+        match fsi.GetBoundValues() |> List.filter (fun b -> not (b.Name.StartsWith measurePrefix)) with
         | [] -> "No bindings yet.", false
         | values ->
             values
@@ -252,8 +436,8 @@ type private Session(refs: string list, outCap: Capture, errCap: Capture) =
         let text = String.Join("\n", parts)
         (if text = "" then "ok (no errors)" else text), hasErrors
 
-/// Worker entry point. Requests: {op: init, refs, native} | {op: eval, code} | {op: typecheck, code};
-/// every reply is {text, isError}.
+/// Worker entry point. Requests: {op: init, refs, native, prelude} | {op: eval, code} | {op: typecheck, code}
+/// | {op: bindings} | {op: measure, expr, iterations}; every reply is {text, isError}, some with extra fields.
 let run () =
     let protocolOut = new StreamWriter(Console.OpenStandardOutput(), UTF8Encoding(false))
     let protocolIn = new StreamReader(Console.OpenStandardInput(), UTF8Encoding(false))
@@ -299,6 +483,21 @@ let run () =
                 replyWith (text, isError) [ "stats", box {| elapsedMs = ms; allocatedBytes = bytes; gen0 = gcs[0]; gen1 = gcs[1]; gen2 = gcs[2] |} ]
             | "typecheck", Some s -> reply (s.Typecheck(str r "code"))
             | "bindings", Some s -> reply (s.Bindings())
+            | "measure", Some s ->
+                match s.Measure(str r "expr", (match r.TryGetProperty "iterations" with | true, v -> v.GetInt32() | _ -> 0)) with
+                | text, isError, Some m ->
+                    replyWith (text, isError) [
+                        "measure",
+                        box
+                            {| medianNs = m.MedianNs
+                               p90Ns = m.P90Ns
+                               bytesPerCall = m.BytesPerCall
+                               gen0 = m.Gen0
+                               gen1 = m.Gen1
+                               gen2 = m.Gen2
+                               iterations = m.Calls
+                               gcServer = Runtime.GCSettings.IsServerGC |} ]
+                | text, isError, None -> reply (text, isError)
             | op, _ -> reply ($"worker: bad op '{op}' (or no session)", true)
         with e -> reply ($"worker error: {formatException e}", true)
         line <- protocolIn.ReadLine()
