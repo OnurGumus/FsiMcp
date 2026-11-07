@@ -2,12 +2,12 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-10-17/server.schema.json",
   "description": "Persistent, project-aware F# Interactive session for AI agents: load a project with its full dependency closure, evaluate code against live state, type-check without running.",
   "name": "io.github.OnurGumus/FsiMcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "packages": [
     {
       "registryType": "nuget",
       "identifier": "FsiMcp",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "transport": {
         "type": "stdio"
       },

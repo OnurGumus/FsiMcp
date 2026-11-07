@@ -40,6 +40,8 @@ A failed build returns only the compiler errors and keeps the current session ru
   call, and output written between calls arrives with the next one.
 - `eval` takes `timeout_seconds` (default 120). On timeout or stack overflow the worker is replaced and the
   agent is told that bindings were lost.
+- Results also carry `structuredContent` for clients that read it: `load_project` returns its `references`
+  and `targetPath`, and `check_project` returns its `diagnostics` (path, line, column, severity, code, message).
 
 ## Session options
 
@@ -49,7 +51,24 @@ A failed build returns only the compiler errors and keeps the current session ru
   opened, so its helpers are usable unqualified. `""` removes it (also accepted by `reset`).
 - `gc_server`: run the session under Server GC, as ASP.NET apps do. Allocation-heavy code can run about twice
   as fast under it, so time code under the GC it will really run with.
+- `artifacts_path`: a directory for build output (`bin`, `obj`), so nothing is written under the project.
+  `""` clears it.
 - `env`: environment variables for the session process.
+
+## Checking a project
+
+`check_project` type-checks a project without building it or touching the F# Interactive session. It
+asks MSBuild for the compiler arguments with a design-time run (`ResolveAssemblyReferencesDesignTime`,
+`ResolveProjectReferencesDesignTime`, `ResolvePackageDependenciesDesignTime`,
+`FindReferenceAssembliesForReferences`, `CoreCompile` with `ProvideCommandLineArgs` and `SkipCompilerExecution`),
+then type-checks the sources with `FSharpChecker` in the server process.
+
+- `overlays` replace the contents of files for this check only, so an agent can test an edit before saving
+  it. A path that is not one of the project's files is added, and checked last.
+- The arguments are cached per project, configuration and artifacts path. The cache is refreshed when the
+  project file or `Directory.Build.props`, `Directory.Build.targets` or `Directory.Packages.props` changes.
+- A referenced project that has never been built triggers one build. Referenced projects are otherwise
+  checked as they were last built; `load_project` or a build refreshes them.
 
 ## Profiling
 
