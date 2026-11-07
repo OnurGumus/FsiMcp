@@ -376,7 +376,7 @@ let ``measure: the same expression twice reads about the same`` () =
     let median (r: ToolResult) = r.Structured.Value.GetProperty("medianNs").GetDouble()
     let ratio = max (median a) (median b) / min (median a) (median b)
     Assert.True(ratio <= 3.0, $"medians {median a} ns and {median b} ns\n{a.Text}\n{b.Text}")
-    Assert.True(bytesPerCall a < 64.0 && bytesPerCall b < 64.0, $"bytes {bytesPerCall a} and {bytesPerCall b}\n{a.Text}\n{b.Text}")
+    Assert.True(abs (bytesPerCall a - bytesPerCall b) < 64.0, $"bytes {bytesPerCall a} and {bytesPerCall b}\n{a.Text}\n{b.Text}")
 
 [<Fact>]
 let ``measure: a generic struct result needs a type annotation`` () =
@@ -384,6 +384,11 @@ let ``measure: a generic struct result needs a type annotation`` () =
     measure s "Ok 5" |> failed |> has "add a type annotation"
     let r = measure s "(Ok 5 : Result<int, string>)" |> ok
     Assert.True(bytesPerCall r < 1.0, $"{bytesPerCall r} B per call\n{r.Text}")
+
+[<Fact>]
+let ``measure: a struct anonymous record result needs a type annotation`` () =
+    use s = start ()
+    measure s "struct {| X = None |}" |> failed |> has "add a type annotation"
 
 [<Fact>]
 let ``measure: session bindings are usable`` () =

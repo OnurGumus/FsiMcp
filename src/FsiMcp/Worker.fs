@@ -365,7 +365,7 @@ type private Session(refs: string list, outCap: Capture, errCap: Capture) =
                 // A generic struct (`Ok 5`, `ValueNone`) as obj would box on every call and read as allocation.
                 let isStruct (t: FSharpType) =
                     let t = if t.IsAbbreviation then t.StripAbbreviations() else t
-                    t.IsStructTupleType || (t.HasTypeDefinition && t.TypeDefinition.IsValueType)
+                    t.IsStructTupleType || (t.IsAnonRecordType && t.Format(FSharpDisplayContext.Empty).StartsWith "struct") || (t.HasTypeDefinition && t.TypeDefinition.IsValueType)
                 // `suffix` is how it compiled: "" or, for a generic reference-type result, " :> obj".
                 let evaluated =
                     match eval (thunk "let mutable" "") with

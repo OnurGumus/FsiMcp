@@ -397,7 +397,7 @@ let private toolsJson =
             "required": ["path", "content"] } } },
       "required": ["project"] } },
   { "name": "measure",
-    "description": "Time and allocations per call of an F# expression, for comparing small code: it is compiled once, warmed up, then run many times. Bindings from the session are available; nothing new is bound.",
+    "description": "Time and allocations per call of an F# expression, for comparing small code: it is compiled and warmed up, then run many times. Bindings from the session are available; nothing new is bound.",
     "inputSchema": { "type": "object", "properties": {
         "expr": { "type": "string", "description": "An F# expression that computes a value (not a function), e.g. List.init 100 id |> List.sum" },
         "iterations": { "type": "integer", "description": "Number of calls, 10 to 1000000 (default: as many as fit in about 1 s)" },

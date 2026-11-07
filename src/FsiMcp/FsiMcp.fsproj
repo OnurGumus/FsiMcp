@@ -8,7 +8,7 @@
     <RollForward>LatestMajor</RollForward>
     <DisableImplicitFSharpCoreReference>true</DisableImplicitFSharpCoreReference>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
-    <Version>0.3.0</Version>
+    <Version>0.4.0</Version>
 
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>fsi-mcp</ToolCommandName>

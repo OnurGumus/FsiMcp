@@ -43,6 +43,8 @@ A failed build returns only the compiler errors and keeps the current session ru
 - `check_project` results also carry `structuredContent` for clients that read it: its `diagnostics` (path,
   line, column, severity, code, message). `load_project` adds `structuredContent` with its `references` and
   `targetPath` only when called with `return_references: true`; otherwise its result is text only, as in 0.2.0.
+  `eval` does the same with `return_structured: true` (its outcome and cost), and `load_project` with
+  `return_references: true` also reports the prelude's outcome.
   `measure` always returns `structuredContent` (see Measuring).
 
 ## Session options
@@ -121,9 +123,12 @@ Allocation volume is a much steadier A/B signal than time.
 
 The loop runs on one thread, so allocations made on other threads (`async`, `Task`, `Parallel`) are not
 counted; the structured result says so in its `note`. Its `gcServer` says which GC the numbers were taken
-under (see `gc_server`). Anything the expression prints is dropped. `timeout_seconds` (default 60) works as
-for `eval`; the warm-up alone takes about 3 s plus 240 calls, so a call of 100 ms or more needs a longer
-timeout.
+under (see `gc_server`). Anything the expression prints is dropped.
+
+The expression runs many more times than the reported call count: a warmed copy, two warm-ups and about
+1 s of batches. Side effects (for example `ResizeArray.Add`) therefore happen far more often than that
+count suggests. `timeout_seconds` (default 60) works as for `eval`; the default fits calls of up to about
+200 ms each, and a slower expression needs a larger `timeout_seconds`.
 
 ## Client configuration
 
