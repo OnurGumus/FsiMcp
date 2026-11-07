@@ -1,0 +1,47 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <!-- Run on the newest installed runtime: the session can then load projects targeting any TFM up to it.
+         Not self-contained on purpose: hosted FSI needs the SDK's reference packs and shared frameworks. -->
+    <RollForward>LatestMajor</RollForward>
+    <DisableImplicitFSharpCoreReference>true</DisableImplicitFSharpCoreReference>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <Version>0.1.0</Version>
+
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>fsi-mcp</ToolCommandName>
+    <PackageType>McpServer</PackageType>
+    <PackageId>FsiMcp</PackageId>
+    <Authors>Onur Gumus</Authors>
+    <Description>MCP server that gives AI agents a persistent, project-aware F# Interactive session: load a project with its full dependency closure, evaluate code against live state, type-check without running.</Description>
+    <PackageTags>fsharp;fsi;repl;interactive;mcp;ai;agent</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/OnurGumus/FsiMcp</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/OnurGumus/FsiMcp</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Text.fs" />
+    <Compile Include="ProjectResolver.fs" />
+    <Compile Include="Worker.fs" />
+    <Compile Include="Server.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="/" />
+    <None Include=".mcp/server.json" Pack="true" PackagePath="/.mcp/" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- FCS pins FSharp.Core exactly. The host's FSharp.Core is the one a session runs on, so it must be
+         at least the loaded project's version. -->
+    <PackageReference Include="FSharp.Core" Version="10.1.401" />
+    <PackageReference Include="FSharp.Compiler.Service" Version="43.12.401" />
+  </ItemGroup>
+
+</Project>

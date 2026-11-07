@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Test
+        run: dotnet test -c Release
+
+      - name: Pack
+        run: dotnet pack src/FsiMcp -c Release -o artifacts
+
+      - name: Install the packed tool and run it
+        shell: bash
+        run: |
+          version=$(basename artifacts/FsiMcp.*.nupkg .nupkg | sed 's/^FsiMcp\.//')
+          dotnet tool install FsiMcp --tool-path ./tool --add-source ./artifacts --version "$version"
+          ./tool/fsi-mcp --version
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.os == 'ubuntu-latest'
+        with:
+          name: nupkg
+          path: artifacts/*.nupkg
