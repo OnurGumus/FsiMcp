@@ -362,6 +362,30 @@ let ``measure: iterations sets the number of calls`` () =
     has "over 500 calls" r
 
 [<Fact>]
+let ``measure: fewer than 10 iterations run 10`` () =
+    use s = start ()
+    let r = s.Call("measure", {| expr = "1 + 1"; iterations = 3 |}) |> ok
+    Assert.Equal(10, r.Structured.Value.GetProperty("iterations").GetInt32())
+
+[<Fact>]
+let ``measure: the same expression twice reads about the same`` () =
+    use s = start ()
+    let expr = "Array.init 100 id |> Array.sum"
+    let a = measure s expr |> ok
+    let b = measure s expr |> ok
+    let median (r: ToolResult) = r.Structured.Value.GetProperty("medianNs").GetDouble()
+    let ratio = max (median a) (median b) / min (median a) (median b)
+    Assert.True(ratio <= 3.0, $"medians {median a} ns and {median b} ns\n{a.Text}\n{b.Text}")
+    Assert.True(bytesPerCall a < 64.0 && bytesPerCall b < 64.0, $"bytes {bytesPerCall a} and {bytesPerCall b}\n{a.Text}\n{b.Text}")
+
+[<Fact>]
+let ``measure: a generic struct result needs a type annotation`` () =
+    use s = start ()
+    measure s "Ok 5" |> failed |> has "add a type annotation"
+    let r = measure s "(Ok 5 : Result<int, string>)" |> ok
+    Assert.True(bytesPerCall r < 1.0, $"{bytesPerCall r} B per call\n{r.Text}")
+
+[<Fact>]
 let ``measure: session bindings are usable`` () =
     use s = start ()
     s.Eval "let n = 50" |> ok |> ignore

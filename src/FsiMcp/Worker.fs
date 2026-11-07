@@ -111,24 +111,52 @@ type private Bench =
             if typeof<'T>.IsValueType then last <- r else GC.KeepAlive(box r)
         last
 
-    /// Warm up, pick a batch size of at least 1 ms, then run batches until `iterations` calls
-    /// (0 = as many as fit in about 1 s, at least 10). Call it on the thread whose allocations count.
-    static member Run<'T>(f: unit -> 'T, iterations: int) : Measurement =
-        let mutable last = Bench.Calls(f, 30)
-        Thread.Sleep 150 // let tiered compilation promote the hot code to tier 1
-        last <- Bench.Calls(f, 30)
-        let auto = iterations <= 0
-        let target = if auto then 1_000_000 else min 1_000_000 (max 10 iterations)
-        let oneMs = Stopwatch.Frequency / 1000L
-        let mutable batch = 1
-        let mutable sizing = true
-        while sizing do
+    /// Call `f` until tiered compilation has settled; returns the last result and the cost per call (ns).
+    /// Tier-up happens in steps (tier 0, instrumented, tier 1 with dynamic PGO, each after a call count
+    /// and a ~100 ms delay): four rounds of 30 calls and a pause, then `callMs` of calls.
+    static member Warm<'T>(f: unit -> 'T, callMs: int) : 'T * float =
+        let freq = Stopwatch.Frequency
+        let mutable last = Unchecked.defaultof<'T>
+        for _ in 1..4 do
+            last <- Bench.Calls(f, 30)
+            Thread.Sleep 150
+        let start = Stopwatch.GetTimestamp()
+        let mutable calls = 0
+        let mutable chunk = 1
+        // Short chunks (up to ~0.1 ms), so the loop around the calls is itself called often and tiers up.
+        while Stopwatch.GetTimestamp() - start < freq * int64 callMs / 1000L do
             let t0 = Stopwatch.GetTimestamp()
-            last <- Bench.Calls(f, batch)
-            if Stopwatch.GetTimestamp() - t0 >= oneMs || batch >= target then sizing <- false
-            else batch <- min target (batch * 2)
-        let perCallNs = Array.zeroCreate<float> ((target + batch - 1) / batch)
-        let tickNs = 1e9 / float Stopwatch.Frequency
+            last <- Bench.Calls(f, chunk)
+            calls <- calls + chunk
+            if Stopwatch.GetTimestamp() - t0 < freq / 10_000L && chunk < 1_000_000 then chunk <- chunk * 2
+        last, max 0.01 (float (Stopwatch.GetTimestamp() - start) * 1e9 / float freq / float calls)
+
+    /// Warm up, size the batches, then run them until `iterations` calls (0 = for about 1 s, at least
+    /// 10 calls). Call it on the thread whose allocations count.
+    ///
+    /// `copy` is the same expression compiled separately, warmed first and longer. With dynamic PGO, `f`
+    /// is compiled at tier 1 once, early; if the code it calls (FSharp.Core and the like) has not settled
+    /// by then, `f` keeps code that is slower and allocates more than what follows a while later. The first
+    /// measure of `Array.init 100 id |> Array.sum` in a session read 416 B per call, every later one 0 B
+    /// (the array is put on the stack); warming a copy for about 0.5 s more was enough, 1.3 s leaves margin.
+    static member Run<'T>(copy: unit -> 'T, f: unit -> 'T, iterations: int) : Measurement =
+        let freq = Stopwatch.Frequency
+        let warmCopy, _ = Bench.Warm(copy, 1300)
+        GC.KeepAlive(box warmCopy)
+        let warm, estimateNs = Bench.Warm(f, 300)
+        let mutable last = warm
+        let auto = iterations <= 0
+        let target = if auto then Int32.MaxValue else min 1_000_000 (max 10 iterations)
+        // A batch of about 1 ms, and at least 10 batches in a run.
+        let budgetCalls = if auto then max 1.0 (1e9 / estimateNs) else float target
+        let batch = max 1 (int (min (ceil (1e6 / estimateNs)) (floor (budgetCalls / 10.0))))
+        // Room for the batches the time budget allows (twice over, should the code get faster); a run
+        // ends early if it fills up.
+        let capacity =
+            if auto then int (min 1e6 (2.0 * ceil (budgetCalls / float batch) + 10.0))
+            else (target + batch - 1) / batch
+        let perCallNs = Array.zeroCreate<float> capacity
+        let tickNs = 1e9 / float freq
         let gc0, gc1, gc2 = GC.CollectionCount 0, GC.CollectionCount 1, GC.CollectionCount 2
         let bytesBefore = GC.GetAllocatedBytesForCurrentThread()
         let start = Stopwatch.GetTimestamp()
@@ -143,7 +171,8 @@ type private Bench =
             perCallNs[batches] <- float (t1 - t0) * tickNs / float n
             batches <- batches + 1
             calls <- calls + n
-            running <- calls < target && (not auto || calls < 10 || t1 - start < Stopwatch.Frequency)
+            running <-
+                calls < target && batches < capacity && (not auto || calls < 10 || t1 - start < freq)
         let bytes = GC.GetAllocatedBytesForCurrentThread() - bytesBefore
         let gens = GC.CollectionCount 0 - gc0, GC.CollectionCount 1 - gc1, GC.CollectionCount 2 - gc2
         GC.KeepAlive(box last)
@@ -296,7 +325,7 @@ type private Session(refs: string list, outCap: Capture, errCap: Capture) =
         // The expression starts on line 4, indented by 12 columns; diagnostics are mapped back to it.
         let body =
             expr.Replace("\r\n", "\n").TrimEnd().Split('\n') |> Array.map (fun l -> "            " + l) |> String.concat "\n"
-        let thunk (binding: string) (suffix: string) =
+        let thunkNamed (binding: string) (name: string) (suffix: string) =
             $"{binding} {name} =\n    fun () ->\n        (\n{body}\n        ){suffix}"
         let diagnostics (diags: FSharpDiagnostic[]) =
             diags
@@ -308,6 +337,7 @@ type private Session(refs: string list, outCap: Capture, errCap: Capture) =
                     else d.StartLine, d.StartColumn + 1
                 $"({line},{col}): error {d.ErrorNumberText}: {d.Message}")
             |> String.concat "\n"
+        let thunk binding suffix = thunkNamed binding name suffix
         let fail (text: string) = text, true, None
         let outcome =
             try
@@ -332,11 +362,30 @@ type private Session(refs: string list, outCap: Capture, errCap: Capture) =
                 // can read (a plain `let f = fun () -> ...` compiles to a method). A generic result
                 // (`failwith ..`, `[]`) cannot be a mutable's type: it is measured as obj instead.
                 let eval code = onBigStack (fun () -> fsi.EvalInteractionNonThrowing code)
+                // A generic struct (`Ok 5`, `ValueNone`) as obj would box on every call and read as allocation.
+                let isStruct (t: FSharpType) =
+                    let t = if t.IsAbbreviation then t.StripAbbreviations() else t
+                    t.IsStructTupleType || (t.HasTypeDefinition && t.TypeDefinition.IsValueType)
+                // `suffix` is how it compiled: "" or, for a generic reference-type result, " :> obj".
                 let evaluated =
                     match eval (thunk "let mutable" "") with
-                    | Choice2Of2 _, diags when diags |> Array.exists (fun d -> d.ErrorNumber = 30) -> eval (thunk "let mutable" " :> obj")
-                    | r -> r
+                    | Choice2Of2 _, diags when diags |> Array.exists (fun d -> d.ErrorNumber = 30) ->
+                        match resultType with
+                        | Some t when isStruct t -> None
+                        | _ -> Some(eval (thunk "let mutable" " :> obj"), " :> obj")
+                    | r -> Some(r, "")
                 match evaluated with
+                | None ->
+                    fail "measure needs a concrete result type here; add a type annotation, e.g. (Ok 5 : Result<int, string>)"
+                | Some evaluated ->
+                match evaluated with
+                | (Choice2Of2 e, diags), _ ->
+                    let shown = diagnostics diags
+                    fail (if shown <> "" then shown else formatException e)
+                | (Choice1Of2 _, _), suffix ->
+                // A second, separately compiled copy to warm up first (see Bench.Run).
+                let copyName = name + "_copy"
+                match eval (thunkNamed "let mutable" copyName suffix) with
                 | Choice2Of2 e, diags ->
                     let shown = diagnostics diags
                     fail (if shown <> "" then shown else formatException e)
@@ -345,19 +394,22 @@ type private Session(refs: string list, outCap: Capture, errCap: Capture) =
                     if isNull t then None
                     elif t.IsGenericType && t.GetGenericTypeDefinition() = typedefof<unit -> unit> then Some t
                     else thunkType t.BaseType
-                match fsi.GetBoundValues() |> List.tryFind (fun b -> b.Name = name) with
-                | None -> fail "measure could not get the compiled expression from the session."
-                | Some b ->
-                match thunkType b.Value.ReflectionType with
-                | None -> fail $"measure could not call the compiled expression (type {b.Value.ReflectionType})."
-                | Some t ->
-                let run =
-                    typeof<Bench>.GetMethod("Run", BindingFlags.Static ||| BindingFlags.Public ||| BindingFlags.NonPublic)
-                        .MakeGenericMethod(t.GetGenericArguments()[1])
-                let m = onBigStack (fun () -> run.Invoke(null, [| b.Value.ReflectionValue; box iterations |]) :?> Measurement)
-                let text =
-                    $"{formatNs m.MedianNs} per call · {formatBytesPerCall m.BytesPerCall} B per call · GCs gen0 {m.Gen0} / gen1 {m.Gen1} / gen2 {m.Gen2} over {m.Calls} calls"
-                text, false, Some m
+                let bound = fsi.GetBoundValues()
+                match bound |> List.tryFind (fun b -> b.Name = name), bound |> List.tryFind (fun b -> b.Name = copyName) with
+                | Some b, Some copy ->
+                    match thunkType b.Value.ReflectionType with
+                    | None -> fail $"measure could not call the compiled expression (type {b.Value.ReflectionType})."
+                    | Some t ->
+                    let run =
+                        typeof<Bench>.GetMethod("Run", BindingFlags.Static ||| BindingFlags.Public ||| BindingFlags.NonPublic)
+                            .MakeGenericMethod(t.GetGenericArguments()[1])
+                    let m =
+                        onBigStack (fun () ->
+                            run.Invoke(null, [| copy.Value.ReflectionValue; b.Value.ReflectionValue; box iterations |]) :?> Measurement)
+                    let text =
+                        $"{formatNs m.MedianNs} per call · {formatBytesPerCall m.BytesPerCall} B per call · GCs gen0 {m.Gen0} / gen1 {m.Gen1} / gen2 {m.Gen2} over {m.Calls} calls"
+                    text, false, Some m
+                | _ -> fail "measure could not get the compiled expression from the session."
             with e -> formatException e, true, None
         // Whatever the expression printed is dropped; output from before this call waits for the next eval.
         outCap.Drain() |> ignore

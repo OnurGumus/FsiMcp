@@ -102,13 +102,19 @@ Allocation volume is a much steadier A/B signal than time.
 1. The expression is bound in the session as a thunk, `fun () -> (expr)`, under a hidden name
    (`__fsimcp_measure_<n>`, never listed by `bindings`), so it is compiled once and sees the session's
    bindings. A compile error is returned with positions in the expression itself, and nothing is kept.
-   An expression whose value is a function is refused: apply it first.
-2. It is called 30 times, then the worker sleeps 150 ms so tiered compilation can promote the hot code,
-   then it is called 30 more times.
-3. The batch size doubles until a batch takes at least 1 ms.
-4. Batches run until `iterations` calls (10 to 1,000,000), or by default until about 1 s has passed
-   (at least 10 calls, at most 1,000,000). Each batch's time per call is recorded; the result is the
-   median and the 90th percentile over batches.
+   An expression whose value is a function is refused: apply it first. A generic result such as
+   `failwith ".."` or `[]` is measured as `obj`; a generic struct such as `Ok 5` or `ValueNone` would be
+   boxed on every call, so it is refused until it is given a type (`(Ok 5 : Result<int, string>)`).
+2. Warm-up: four rounds of 30 calls and a 150 ms pause, so tiered compilation (tier 0, instrumented,
+   tier 1 with dynamic PGO) can settle, then about 300 ms of calls. A second copy of the thunk, compiled
+   separately, is warmed the same way and longer (1.3 s of calls) before that: the code the expression
+   calls must settle before the thunk itself is compiled at tier 1, or the first measure of an expression
+   in a session can read slower and allocate more than every later one (416 B against 0 B per call for
+   `Array.init 100 id |> Array.sum`, whose array .NET 10 can put on the stack).
+3. Batches take about 1 ms each, and a run has at least 10 of them.
+4. Batches run until `iterations` calls (10 to 1,000,000), or by default for about 1 s (at least 10
+   calls). Each batch's time per call is recorded; the result is the median and the 90th percentile over
+   batches.
 5. Bytes per call are `GC.GetAllocatedBytesForCurrentThread` before and after the loop, divided by the
    calls; GC counts are for the whole loop. The results are kept (`GC.KeepAlive`), so the work is not
    optimised away.
@@ -116,7 +122,8 @@ Allocation volume is a much steadier A/B signal than time.
 The loop runs on one thread, so allocations made on other threads (`async`, `Task`, `Parallel`) are not
 counted; the structured result says so in its `note`. Its `gcServer` says which GC the numbers were taken
 under (see `gc_server`). Anything the expression prints is dropped. `timeout_seconds` (default 60) works as
-for `eval`.
+for `eval`; the warm-up alone takes about 3 s plus 240 calls, so a call of 100 ms or more needs a longer
+timeout.
 
 ## Client configuration
 
