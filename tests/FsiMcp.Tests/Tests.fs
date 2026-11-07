@@ -325,6 +325,24 @@ let ``load_project structured: a good prelude is loaded`` () =
     Assert.True(p.GetProperty("seconds").GetDouble() >= 0.0)
 
 [<Fact>]
+let ``a prelude with a dotted file name opens as a module path`` () =
+    let dir = copyFixture "SampleLib"
+    let f = Path.Combine(dir, "lab.setup.fsx")
+    File.WriteAllText(f, "let sample = 41\n")
+    use s = start ()
+    s.Call("load_project", {| path = dir; prelude = f |}) |> ok |> lacks "could not open" |> ignore
+    s.Eval "sample" |> ok |> has "val it: int = 41"
+
+[<Fact>]
+let ``a prelude whose name needs quoting still opens`` () =
+    let dir = copyFixture "SampleLib"
+    let f = Path.Combine(dir, "my-helpers.fsx")
+    File.WriteAllText(f, "let sample = 42\n")
+    use s = start ()
+    s.Call("load_project", {| path = dir; prelude = f |}) |> ok |> lacks "could not open" |> ignore
+    s.Eval "sample" |> ok |> has "val it: int = 42"
+
+[<Fact>]
 let ``load_project structured: a slow prelude reports its own load time`` () =
     let dir = copyFixture "SampleLib"
     let slow = Path.Combine(dir, "slow.fsx")

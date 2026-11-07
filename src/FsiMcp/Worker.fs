@@ -476,7 +476,10 @@ type private Session(refs: string list, outCap: Capture, errCap: Capture) =
             | None ->
                 let n = Path.GetFileNameWithoutExtension path
                 let n = string (Char.ToUpperInvariant n[0]) + n.Substring 1
-                if n |> Seq.forall (fun c -> Char.IsLetterOrDigit c || c = '_') then n else $"``{n}``"
+                // A dotted file name is a module path: quote only the parts that are not plain identifiers.
+                let plain (part: string) =
+                    part.Length > 0 && not (Char.IsDigit part[0]) && part |> Seq.forall (fun c -> Char.IsLetterOrDigit c || c = '_')
+                n.Split '.' |> Array.map (fun part -> if plain part then part else $"``{part}``") |> String.concat "."
         let opens =
             lines
             |> Array.choose (fun l -> if l.StartsWith "open " then Some(l.Substring(5).Trim()) else None)
