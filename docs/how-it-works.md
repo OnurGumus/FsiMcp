@@ -43,9 +43,11 @@ A failed build returns only the compiler errors and keeps the current session ru
 - `check_project` results also carry `structuredContent` for clients that read it: its `diagnostics` (path,
   line, column, severity, code, message). `load_project` adds `structuredContent` with its `references` and
   `targetPath` only when called with `return_references: true`; otherwise its result is text only, as in 0.2.0.
-  `eval` does the same with `return_structured: true` (its outcome and cost), and `load_project` with
-  `return_references: true` also reports the prelude's outcome.
-  `measure` always returns `structuredContent` (see Measuring).
+  `eval` does the same with `return_structured: true` (its outcome and cost: `ok`, `restarted`, `stats`;
+  when the session was lost to a timeout or crash, `restarted` is true and `stats` are the wall time until
+  then and zeros), and `load_project` with `return_references: true` also reports the prelude's outcome.
+  `measure` returns `structuredContent` on success (see Measuring); its errors and refusals are text only,
+  except that a `measure` which lost the session returns `{ "restarted": true }` with its error text.
 
 ## Session options
 
@@ -112,10 +114,13 @@ Allocation volume is a much steadier A/B signal than time.
    separately, is warmed the same way and longer (1.3 s of calls) before that: the code the expression
    calls must settle before the thunk itself is compiled at tier 1, or the first measure of an expression
    in a session can read slower and allocate more than every later one (416 B against 0 B per call for
-   `Array.init 100 id |> Array.sum`, whose array .NET 10 can put on the stack).
+   `Array.init 100 id |> Array.sum`, whose array .NET 10 can put on the stack). A round that takes more
+   than 200 ms (not counting the very first call, which pays for JIT and loading) ends that warm-up at
+   once: at that cost per call the JIT matters little, and a few calls are enough. An expression of
+   300 ms per call is warmed with two calls of each copy.
 3. Batches take about 1 ms each, and a run has at least 10 of them.
-4. Batches run until `iterations` calls (10 to 1,000,000), or by default for about 1 s (at least 10
-   calls). Each batch's time per call is recorded; the result is the median and the 90th percentile over
+4. Batches run until `iterations` calls (10 to 1,000,000; fewer, negative included, run 10), or by
+   default for about 1 s (at least 10 calls). Each batch's time per call is recorded; the result is the median and the 90th percentile over
    batches.
 5. Bytes per call are `GC.GetAllocatedBytesForCurrentThread` before and after the loop, divided by the
    calls; GC counts are for the whole loop. The results are kept (`GC.KeepAlive`), so the work is not
@@ -127,8 +132,9 @@ under (see `gc_server`). Anything the expression prints is dropped.
 
 The expression runs many more times than the reported call count: a warmed copy, two warm-ups and about
 1 s of batches. Side effects (for example `ResizeArray.Add`) therefore happen far more often than that
-count suggests. `timeout_seconds` (default 60) works as for `eval`; the default fits calls of up to about
-200 ms each, and a slower expression needs a larger `timeout_seconds`.
+count suggests. `timeout_seconds` (default 60) works as for `eval`. Each call should take well under a
+second; with the default `iterations` the whole run is about 14 calls' worth for a slow expression, so
+very slow expressions (or many iterations of a slow one) need a larger `timeout_seconds`.
 
 ## Client configuration
 

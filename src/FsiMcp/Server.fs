@@ -153,16 +153,21 @@ type private Front(log: TextWriter) =
         | Some w when w.Alive -> Ok w
         | _ -> spawn () |> Result.map (fun _ -> worker.Value)
 
-    /// The reply text and error flag, the worker's reply object (when it sent one), and whether this
-    /// call lost the session (timeout or crash).
+    /// The reply text and error flag, the worker's reply object (when it sent one), whether this call
+    /// lost the session (timeout or crash), and the time the request took (ms; a restart after it is not
+    /// counted).
     let requestFull (msg: obj) (timeout: TimeSpan) (ct: CancellationToken) =
+        let startSw = Stopwatch.StartNew()
         match ensure () with
-        | Error e -> ($"Could not start the F# session: {e}", true), None, false
+        | Error e -> ($"Could not start the F# session: {e}", true), None, false, startSw.Elapsed.TotalMilliseconds
         | Ok w ->
-            match w.RequestRaw(msg, timeout, ct) with
+            let sw = Stopwatch.StartNew()
+            let reply = w.RequestRaw(msg, timeout, ct)
+            let elapsedMs = sw.Elapsed.TotalMilliseconds
+            match reply with
             | Some(text, isError, root) ->
                 if not w.Alive then worker <- None
-                (text, isError), root, root.IsNone
+                (text, isError), root, root.IsNone, elapsedMs
             | None ->
                 let why = if ct.IsCancellationRequested then "was cancelled" else $"timed out after {timeout.TotalSeconds:F0}s"
                 let restart =
@@ -171,10 +176,10 @@ type private Front(log: TextWriter) =
                         let refs = if loaded.IsSome then "; project references re-applied" else ""
                         $"A fresh session is ready ({t}{refs}). All earlier bindings are lost."
                     | Error e -> $"Restarting failed: {e}"
-                ($"Evaluation {why}; the worker process was killed. {restart}", true), None, true
+                ($"Evaluation {why}; the worker process was killed. {restart}", true), None, true, elapsedMs
 
     let request (msg: obj) (timeout: TimeSpan) (ct: CancellationToken) =
-        let r, _, _ = requestFull msg timeout ct
+        let r, _, _, _ = requestFull msg timeout ct
         r
 
     member _.Warm() = ensure () |> ignore
@@ -184,15 +189,15 @@ type private Front(log: TextWriter) =
         snapshotDir |> Option.iter Snapshot.delete
 
     member _.Eval(code: string, timeoutSeconds: int, returnStructured: bool, ct) =
-        let sw = Stopwatch.StartNew()
-        let (text, isError), root, restarted =
+        let (text, isError), root, restarted, requestMs =
             requestFull {| op = "eval"; code = code |} (TimeSpan.FromSeconds(float timeoutSeconds)) ct
         if not returnStructured then plain (text, isError)
         else
             let stats = root |> Option.bind (fun r -> match r.TryGetProperty "stats" with | true, st -> Some st | _ -> None)
             let num (name: string) = stats |> Option.map (fun st -> st.GetProperty(name).GetDouble()) |> Option.defaultValue 0.0
-            // A lost session has no stats from the worker: report the wall time spent, and zero for the rest.
-            let elapsed = if stats.IsSome then num "elapsedMs" else sw.Elapsed.TotalMilliseconds
+            // A lost session has no stats from the worker: report the wall time until it was lost (not the
+            // restart after it), and zero for the rest.
+            let elapsed = if stats.IsSome then num "elapsedMs" else requestMs
             { Text = text
               IsError = isError
               Structured =
@@ -301,9 +306,10 @@ type private Front(log: TextWriter) =
 
     /// Time and allocations per call of an expression, measured in the worker.
     member _.Measure(expr: string, iterations: int, timeoutSeconds: int, ct) =
-        let (text, isError), root, _ =
+        let (text, isError), root, restarted, _ =
             requestFull {| op = "measure"; expr = expr; iterations = iterations |} (TimeSpan.FromSeconds(float timeoutSeconds)) ct
         match root |> Option.bind (fun r -> match r.TryGetProperty "measure" with | true, m -> Some m | _ -> None) with
+        | None when restarted -> { Text = text; IsError = isError; Structured = Some(box {| restarted = true |}) }
         | None -> plain (text, isError)
         | Some m ->
             let num (name: string) = m.GetProperty(name).GetDouble()
@@ -319,7 +325,7 @@ type private Front(log: TextWriter) =
                            gen0 = count "gen0"
                            gen1 = count "gen1"
                            gen2 = count "gen2"
-                           iterations = count "iterations"
+                           iterations = m.GetProperty("iterations").GetInt64()
                            gcServer = m.GetProperty("gcServer").GetBoolean()
                            note = "Allocations on other threads (async, Task, Parallel) are not counted." |}
                 ) }
@@ -352,7 +358,7 @@ let private toolsJson =
     "inputSchema": { "type": "object", "properties": {
         "code": { "type": "string", "description": "F# code: declarations, expressions, #r/#load/open directives" },
         "timeout_seconds": { "type": "integer", "description": "Kill the session after this many seconds (default 120); state is lost" },
-        "return_structured": { "type": "boolean", "description": "Also return the outcome and cost as structured content" } },
+        "return_structured": { "type": "boolean", "description": "Also return the outcome and cost as structured content: ok, restarted, stats (elapsedMs, allocatedBytes, gen0, gen1, gen2). restarted: the session was lost (timeout or crash); stats are then the wall time and zeros" } },
       "required": ["code"] } },
   { "name": "typecheck",
     "description": "Type-check F# code against the current session (loaded project + earlier bindings) WITHOUT running it or binding anything. Returns inferred signatures, or compiler diagnostics.",
@@ -397,11 +403,11 @@ let private toolsJson =
             "required": ["path", "content"] } } },
       "required": ["project"] } },
   { "name": "measure",
-    "description": "Time and allocations per call of an F# expression, for comparing small code: it is compiled and warmed up, then run many times. Bindings from the session are available; nothing new is bound.",
+    "description": "Time and allocations per call of an F# expression, for comparing small code: it is compiled and warmed up, then run many times. Bindings from the session are available; nothing new is bound. Each call should take well under a second; very slow expressions need a larger timeout_seconds.",
     "inputSchema": { "type": "object", "properties": {
         "expr": { "type": "string", "description": "An F# expression that computes a value (not a function), e.g. List.init 100 id |> List.sum" },
         "iterations": { "type": "integer", "description": "Number of calls, 10 to 1000000 (default: as many as fit in about 1 s)" },
-        "timeout_seconds": { "type": "integer", "description": "Kill the session after this many seconds (default 60); state is lost" } },
+        "timeout_seconds": { "type": "integer", "description": "Kill the session after this many seconds (default 60); state is lost. Each call should take well under a second; very slow expressions need a larger timeout_seconds" } },
       "required": ["expr"] } }
 ]
 """

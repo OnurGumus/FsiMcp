@@ -293,7 +293,9 @@ let ``eval structured: a timeout reports restarted`` () =
     let sc = r.Structured.Value
     Assert.False(sc.GetProperty("ok").GetBoolean())
     Assert.True(sc.GetProperty("restarted").GetBoolean())
-    Assert.True(sc.GetProperty("stats").GetProperty("elapsedMs").GetDouble() >= 0.0)
+    // The time until the session was lost, not the restart after it.
+    let elapsed = sc.GetProperty("stats").GetProperty("elapsedMs").GetDouble()
+    Assert.True(elapsed >= 1900.0 && elapsed < 2900.0, $"elapsedMs {elapsed}\n{r.Text}")
 
 [<Fact>]
 let ``eval without the flag has no structured content`` () =
@@ -345,7 +347,7 @@ let ``measure: a list costs more than an array`` () =
     let sc = list.Structured.Value
     Assert.True(sc.GetProperty("medianNs").GetDouble() > 0.0)
     Assert.True(sc.GetProperty("p90Ns").GetDouble() >= sc.GetProperty("medianNs").GetDouble())
-    Assert.True(sc.GetProperty("iterations").GetInt32() >= 10)
+    Assert.True(sc.GetProperty("iterations").GetInt64() >= 10L)
     Assert.False(sc.GetProperty("gcServer").GetBoolean())
 
 [<Fact>]
@@ -368,15 +370,39 @@ let ``measure: fewer than 10 iterations run 10`` () =
     Assert.Equal(10, r.Structured.Value.GetProperty("iterations").GetInt32())
 
 [<Fact>]
+let ``measure: negative iterations run 10`` () =
+    use s = start ()
+    let r = s.Call("measure", {| expr = "1 + 1"; iterations = -5 |}) |> ok
+    Assert.Equal(10L, r.Structured.Value.GetProperty("iterations").GetInt64())
+
+let median (r: ToolResult) = r.Structured.Value.GetProperty("medianNs").GetDouble()
+
+[<Fact>]
 let ``measure: the same expression twice reads about the same`` () =
     use s = start ()
+    // Whether .NET puts this array on the stack depends on when the JIT gets to it: compare times only.
     let expr = "Array.init 100 id |> Array.sum"
     let a = measure s expr |> ok
     let b = measure s expr |> ok
-    let median (r: ToolResult) = r.Structured.Value.GetProperty("medianNs").GetDouble()
     let ratio = max (median a) (median b) / min (median a) (median b)
     Assert.True(ratio <= 3.0, $"medians {median a} ns and {median b} ns\n{a.Text}\n{b.Text}")
+
+[<Fact>]
+let ``measure: the same allocating expression twice allocates the same`` () =
+    use s = start ()
+    let expr = "List.init 100 id |> List.sum" // allocates its 100 cells whatever the JIT does
+    let a = measure s expr |> ok
+    let b = measure s expr |> ok
     Assert.True(abs (bytesPerCall a - bytesPerCall b) < 64.0, $"bytes {bytesPerCall a} and {bytesPerCall b}\n{a.Text}\n{b.Text}")
+
+[<Fact>]
+let ``measure: a slow expression fits the default timeout and keeps the session`` () =
+    use s = start ()
+    s.Eval "let before = 42" |> ok |> ignore
+    let r = s.Call("measure", {| expr = "System.Threading.Thread.Sleep 300"; iterations = 10 |}) |> ok
+    Assert.Equal(10L, r.Structured.Value.GetProperty("iterations").GetInt64())
+    Assert.True(median r >= 250e6, $"median {median r} ns\n{r.Text}")
+    s.Eval "before" |> ok |> has "val it: int = 42"
 
 [<Fact>]
 let ``measure: a generic struct result needs a type annotation`` () =
@@ -423,8 +449,15 @@ let ``measure: a generic result is measured`` () =
 [<Fact>]
 let ``measure: a timeout restarts the session`` () =
     use s = start ()
-    s.Call("measure", {| expr = "System.Threading.Thread.Sleep 1000"; timeout_seconds = 2 |}) |> failed |> has "timed out"
+    let r = s.Call("measure", {| expr = "System.Threading.Thread.Sleep 1000"; timeout_seconds = 2 |}) |> failed
+    has "timed out" r
+    Assert.True(r.Structured.Value.GetProperty("restarted").GetBoolean())
     s.Eval "1 + 1" |> ok |> has "val it: int = 2"
+
+[<Fact>]
+let ``measure: an error that keeps the session has no structured content`` () =
+    use s = start ()
+    Assert.True((measure s "undefinedThing + 1" |> failed).Structured.IsNone)
 
 [<Fact>]
 let ``measure: the note says other threads are not counted`` () =

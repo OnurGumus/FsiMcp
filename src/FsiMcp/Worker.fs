@@ -98,7 +98,7 @@ type private Measurement =
       Gen0: int
       Gen1: int
       Gen2: int
-      Calls: int }
+      Calls: int64 }
 
 /// The measuring loop, compiled per result type so calling the thunk never boxes or allocates.
 type private Bench =
@@ -114,25 +114,46 @@ type private Bench =
     /// Call `f` until tiered compilation has settled; returns the last result and the cost per call (ns).
     /// Tier-up happens in steps (tier 0, instrumented, tier 1 with dynamic PGO, each after a call count
     /// and a ~100 ms delay): four rounds of 30 calls and a pause, then `callMs` of calls.
+    ///
+    /// A round that takes more than 200 ms ends the warm-up there: at that cost per call the JIT's work
+    /// is lost in the noise, and 30 calls of a 300 ms expression would take 9 s a round. The very first
+    /// call (JIT, type loading, a first use of a library) is not timed.
     static member Warm<'T>(f: unit -> 'T, callMs: int) : 'T * float =
         let freq = Stopwatch.Frequency
-        let mutable last = Unchecked.defaultof<'T>
-        for _ in 1..4 do
-            last <- Bench.Calls(f, 30)
-            Thread.Sleep 150
+        let slowRound = freq / 5L // 200 ms
+        let mutable last = Bench.Calls(f, 1)
+        let mutable slow = None // (ticks, timed calls) of the round that ran past 200 ms
+        let mutable round = 0
+        while slow.IsNone && round < 4 do
+            let t0 = Stopwatch.GetTimestamp()
+            let mutable calls = if round = 0 then 1 else 0 // round 0 began with the cold call
+            let mutable timed = 0L
+            while slow.IsNone && calls < 30 do
+                last <- Bench.Calls(f, 1)
+                calls <- calls + 1
+                timed <- timed + 1L
+                let ticks = Stopwatch.GetTimestamp() - t0
+                if ticks > slowRound then slow <- Some(ticks, timed)
+            if slow.IsNone then Thread.Sleep 150
+            round <- round + 1
+        match slow with
+        | Some(ticks, calls) -> last, max 0.01 (float ticks * 1e9 / float freq / float calls)
+        | None ->
         let start = Stopwatch.GetTimestamp()
-        let mutable calls = 0
+        let mutable calls = 0L
         let mutable chunk = 1
         // Short chunks (up to ~0.1 ms), so the loop around the calls is itself called often and tiers up.
         while Stopwatch.GetTimestamp() - start < freq * int64 callMs / 1000L do
             let t0 = Stopwatch.GetTimestamp()
             last <- Bench.Calls(f, chunk)
-            calls <- calls + chunk
+            calls <- calls + int64 chunk
             if Stopwatch.GetTimestamp() - t0 < freq / 10_000L && chunk < 1_000_000 then chunk <- chunk * 2
         last, max 0.01 (float (Stopwatch.GetTimestamp() - start) * 1e9 / float freq / float calls)
 
     /// Warm up, size the batches, then run them until `iterations` calls (0 = for about 1 s, at least
-    /// 10 calls). Call it on the thread whose allocations count.
+    /// 10 calls; fewer than 10, negative included, = 10). Call it on the thread whose allocations count.
+    /// The warm-ups are bounded in time (see Warm): an expression of about 300 ms per call takes about
+    /// 1.2 s of warm-up (two calls of each copy), then 3 s of 10 timed calls.
     ///
     /// `copy` is the same expression compiled separately, warmed first and longer. With dynamic PGO, `f`
     /// is compiled at tier 1 once, early; if the code it calls (FSharp.Core and the like) has not settled
@@ -145,8 +166,8 @@ type private Bench =
         GC.KeepAlive(box warmCopy)
         let warm, estimateNs = Bench.Warm(f, 300)
         let mutable last = warm
-        let auto = iterations <= 0
-        let target = if auto then Int32.MaxValue else min 1_000_000 (max 10 iterations)
+        let auto = iterations = 0
+        let target = if auto then Int64.MaxValue else int64 (min 1_000_000 (max 10 iterations))
         // A batch of about 1 ms, and at least 10 batches in a run.
         let budgetCalls = if auto then max 1.0 (1e9 / estimateNs) else float target
         let batch = max 1 (int (min (ceil (1e6 / estimateNs)) (floor (budgetCalls / 10.0))))
@@ -154,25 +175,25 @@ type private Bench =
         // ends early if it fills up.
         let capacity =
             if auto then int (min 1e6 (2.0 * ceil (budgetCalls / float batch) + 10.0))
-            else (target + batch - 1) / batch
+            else int ((target + int64 batch - 1L) / int64 batch)
         let perCallNs = Array.zeroCreate<float> capacity
         let tickNs = 1e9 / float freq
         let gc0, gc1, gc2 = GC.CollectionCount 0, GC.CollectionCount 1, GC.CollectionCount 2
         let bytesBefore = GC.GetAllocatedBytesForCurrentThread()
         let start = Stopwatch.GetTimestamp()
-        let mutable calls = 0
+        let mutable calls = 0L
         let mutable batches = 0
         let mutable running = true
         while running do
-            let n = min batch (target - calls)
+            let n = int (min (int64 batch) (target - calls))
             let t0 = Stopwatch.GetTimestamp()
             last <- Bench.Calls(f, n)
             let t1 = Stopwatch.GetTimestamp()
             perCallNs[batches] <- float (t1 - t0) * tickNs / float n
             batches <- batches + 1
-            calls <- calls + n
+            calls <- calls + int64 n
             running <-
-                calls < target && batches < capacity && (not auto || calls < 10 || t1 - start < freq)
+                calls < target && batches < capacity && (not auto || calls < 10L || t1 - start < freq)
         let bytes = GC.GetAllocatedBytesForCurrentThread() - bytesBefore
         let gens = GC.CollectionCount 0 - gc0, GC.CollectionCount 1 - gc1, GC.CollectionCount 2 - gc2
         GC.KeepAlive(box last)
@@ -205,8 +226,7 @@ let private formatNs (ns: float) =
     v.ToString(digits, Globalization.CultureInfo.InvariantCulture) + " " + unit
 
 let private formatBytesPerCall (b: float) =
-    let s = b.ToString((if b >= 100.0 then "F0" else "0.##"), Globalization.CultureInfo.InvariantCulture)
-    if s = "-0" then "0" else s
+    b.ToString((if b >= 100.0 then "F0" else "0.##"), Globalization.CultureInfo.InvariantCulture)
 
 /// Prefix of the bindings `measure` makes; `bindings` never lists them.
 let private measurePrefix = "__fsimcp_measure_"
