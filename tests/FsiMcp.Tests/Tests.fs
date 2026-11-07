@@ -322,6 +322,18 @@ let ``load_project structured: a good prelude is loaded`` () =
     let p = r.Structured.Value.GetProperty("prelude")
     Assert.True(p.GetProperty("loaded").GetBoolean())
     Assert.Contains("loaded", p.GetProperty("message").GetString())
+    Assert.True(p.GetProperty("seconds").GetDouble() >= 0.0)
+
+[<Fact>]
+let ``load_project structured: a slow prelude reports its own load time`` () =
+    let dir = copyFixture "SampleLib"
+    let slow = Path.Combine(dir, "slow.fsx")
+    File.WriteAllText(slow, "System.Threading.Thread.Sleep 1200\nlet slowValue = 1\n")
+    use s = start ()
+    let r = s.Call("load_project", {| path = dir; prelude = slow; return_references = true |}) |> ok
+    let p = r.Structured.Value.GetProperty("prelude")
+    Assert.True(p.GetProperty("loaded").GetBoolean())
+    Assert.True(p.GetProperty("seconds").GetDouble() >= 1.0)
 
 [<Fact>]
 let ``load_project structured: no prelude is null`` () =

@@ -45,7 +45,9 @@ A failed build returns only the compiler errors and keeps the current session ru
   `targetPath` only when called with `return_references: true`; otherwise its result is text only, as in 0.2.0.
   `eval` does the same with `return_structured: true` (its outcome and cost: `ok`, `restarted`, `stats`;
   when the session was lost to a timeout or crash, `restarted` is true and `stats` are the wall time until
-  then and zeros), and `load_project` with `return_references: true` also reports the prelude's outcome.
+  then and zeros), and `load_project` with `return_references: true` also reports the prelude's outcome
+  (`prelude: { loaded, message, seconds } | null`; `seconds` is the wall time of loading the prelude script alone,
+  not the build, and `prelude` is null when none is set).
   `measure` returns `structuredContent` on success (see Measuring); its errors and refusals are text only,
   except that a `measure` which lost the session returns `{ "restarted": true }` with its error text.
 

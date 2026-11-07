@@ -109,7 +109,7 @@ type private Front(log: TextWriter) =
     let mutable artifactsPath: string option = None
     let mutable extraEnv: (string * string) list = []
     // The prelude's outcome in the session spawn() last started; None = no prelude.
-    let mutable preludeOutcome: (bool * string) option = None
+    let mutable preludeOutcome: (bool * string * float) option = None
     let mutable lastSurface: (string * string list) option = None
     // check_project runs here in the server process, never in the worker.
     let checker = lazy (ProjectChecker.Checker())
@@ -138,7 +138,7 @@ type private Front(log: TextWriter) =
                 |> Option.bind (fun r ->
                     match r.TryGetProperty "prelude" with
                     | true, p when p.ValueKind = JsonValueKind.Object ->
-                        Some(p.GetProperty("loaded").GetBoolean(), str p "message")
+                        Some(p.GetProperty("loaded").GetBoolean(), str p "message", p.GetProperty("seconds").GetDouble())
                     | _ -> None)
             Ok text
         | Some(text, true, _) ->
@@ -274,7 +274,7 @@ type private Front(log: TextWriter) =
                     if returnReferences then
                         let prelude =
                             match preludeOutcome with
-                            | Some(loaded, message) -> box {| loaded = loaded; message = message |}
+                            | Some(loaded, message, seconds) -> box {| loaded = loaded; message = message; seconds = seconds |}
                             | None -> null
                         Some(box {| references = Array.ofList stableRefs; targetPath = r.TargetPath; prelude = prelude |})
                     else None }

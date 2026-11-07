@@ -455,12 +455,14 @@ type private Session(refs: string list, outCap: Capture, errCap: Capture) =
     /// `#load` a script, then open its module and replay its top-level `open`s in the session, so its
     /// helpers are usable unqualified, as if typed in. Each step is its own interaction: a failing
     /// open cannot roll back the load.
-    member this.LoadPrelude(path: string) : string * bool =
+    member this.LoadPrelude(path: string) : string * bool * float =
         let name = Path.GetFileName path
-        if not (File.Exists path) then $"prelude {name}: NOT FOUND at {path}", false
+        if not (File.Exists path) then $"prelude {name}: NOT FOUND at {path}", false, 0.0
         else
+        let sw = Stopwatch.StartNew()
         let loadText, loadFailed = this.Eval($"#load @\"{path}\"")
-        if loadFailed then $"prelude {name}: FAILED to load\n{clip 3000 loadText}", false
+        let seconds = sw.Elapsed.TotalSeconds // the script's own load only, not the opens below
+        if loadFailed then $"prelude {name}: FAILED to load\n{clip 3000 loadText}", false, seconds
         else
         let lines = File.ReadAllLines path
         let explicitModule =
@@ -484,7 +486,7 @@ type private Session(refs: string list, outCap: Capture, errCap: Capture) =
         let failed = results |> List.filter snd |> List.map fst
         let failedText = if failed.IsEmpty then "" else "; could not open " + String.Join(", ", failed)
         let openedText = String.Join(", ", opened)
-        $"prelude {name}: loaded; opened {openedText}{failedText}", true
+        $"prelude {name}: loaded; opened {openedText}{failedText}", true, seconds
 
     member _.Typecheck(code: string) : string * bool =
         let parse, check, _ = fsi.ParseAndCheckInteraction code
@@ -548,8 +550,8 @@ let run () =
                 match str r "prelude" with
                 | "" -> reply (ready, false)
                 | path ->
-                    let message, loaded = s.LoadPrelude path
-                    replyWith (ready + "\n" + message, false) [ "prelude", box {| loaded = loaded; message = message |} ]
+                    let message, loaded, seconds = s.LoadPrelude path
+                    replyWith (ready + "\n" + message, false) [ "prelude", box {| loaded = loaded; message = message; seconds = seconds |} ]
             | "eval", Some s ->
                 let text, isError, (ms, bytes, gcs) = s.EvalWithStats(str r "code")
                 replyWith (text, isError) [ "stats", box {| elapsedMs = ms; allocatedBytes = bytes; gen0 = gcs[0]; gen1 = gcs[1]; gen2 = gcs[2] |} ]
