@@ -262,6 +262,16 @@ let ``load_project returns the project's own copy of a package the server also s
     s.Eval "HostShadowLib.Lib.level" |> ok |> has "Warning"
 
 [<Fact>]
+let ``a project using a recent Microsoft.Extensions.Logging runs in the session`` () =
+    // The server ships Logging.Abstractions (a dependency of its profiler); the session runs the server's
+    // copy, so it must be at least as recent as what current projects use.
+    let dir = copyFixture "HostShadowLib"
+    use s = start ()
+    let r = s.LoadProject dir |> ok
+    Assert.DoesNotContain("CONFLICT", r.Text)
+    s.Eval "HostShadowLib.Lib.builderAssemblyMajor ()" |> ok |> has "val it: int = 10"
+
+[<Fact>]
 let ``load_project without return_references and eval carry no structured content`` () =
     let dir = copyFixture "SampleLib"
     use s = start ()

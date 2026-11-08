@@ -46,6 +46,9 @@
     <PackageReference Include="FSharp.Compiler.Service" Version="43.12.401" />
     <!-- Used by the SERVER process only (profile tool), never inside the worker's session. -->
     <PackageReference Include="Microsoft.Diagnostics.NETCore.Client" Version="0.2.621003" />
+    <!-- The profiler's dependency, pinned to a recent version: the session runs this copy in place of the
+         project's (one per name in a process), and an older one breaks projects that log (ILoggingBuilder). -->
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
     <PackageReference Include="Microsoft.Diagnostics.Tracing.TraceEvent" Version="3.1.19" />
   </ItemGroup>
 
