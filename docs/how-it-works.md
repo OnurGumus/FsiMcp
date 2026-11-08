@@ -43,6 +43,8 @@ A failed build returns only the compiler errors and keeps the current session ru
 - `check_project` results also carry `structuredContent` for clients that read it: its `diagnostics` (path,
   line, column, severity, code, message). `load_project` adds `structuredContent` with its `references` and
   `targetPath` only when called with `return_references: true`; otherwise its result is text only, as in 0.2.0.
+  The `references` are for an editor: the project's own build and package files, also for an assembly the
+  session runs from this tool's own copy (whose folder a tool update deletes).
   `eval` does the same with `return_structured: true` (its outcome and cost: `ok`, `restarted`, `stats`;
   when the session was lost to a timeout or crash, `restarted` is true and `stats` are the wall time until
   then and zeros), and `load_project` with `return_references: true` also reports the prelude's outcome

@@ -247,6 +247,21 @@ let ``load_project returns its references as structured content when asked`` () 
     Assert.True(File.Exists(r.Structured.Value.GetProperty("targetPath").GetString()))
 
 [<Fact>]
+let ``load_project returns the project's own copy of a package the server also ships`` () =
+    // The session runs the server's copy (one assembly per name in a process); an editor given that path
+    // breaks when the tool is updated and its folder deleted. References are for editors: the package's.
+    let dir = copyFixture "HostShadowLib"
+    use s = start ()
+    let r = s.Call("load_project", {| path = dir; return_references = true |}) |> ok
+    let refs = [ for e in r.Structured.Value.GetProperty("references").EnumerateArray() -> e.GetString() ]
+    let sep = string Path.DirectorySeparatorChar
+    let logging = refs |> List.filter (fun p -> p.EndsWith "Microsoft.Extensions.Logging.Abstractions.dll")
+    Assert.Equal(1, logging.Length)
+    Assert.Contains(sep + "microsoft.extensions.logging.abstractions" + sep, logging.Head.ToLowerInvariant())
+    Assert.All(refs, fun p -> Assert.True(File.Exists p, p))
+    s.Eval "HostShadowLib.Lib.level" |> ok |> has "Warning"
+
+[<Fact>]
 let ``load_project without return_references and eval carry no structured content`` () =
     let dir = copyFixture "SampleLib"
     use s = start ()

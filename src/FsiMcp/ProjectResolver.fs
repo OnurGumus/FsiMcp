@@ -74,6 +74,9 @@ type Resolved =
       TargetPath: string
       /// Assemblies to reference (-r:), in order: the project's output, its closure, host copies, ASP.NET Core.
       Managed: string list
+      /// Managed for an editor: the project's own copy where the session runs the host's (the host's copy
+      /// lives in this tool's install folder, which a tool update deletes).
+      EditorRefs: string list
       /// Of Managed: files the project's own build produces (they change on rebuild; NuGet-cache files never do).
       Built: Set<string>
       /// Native library file name -> path, best match for this machine.
@@ -167,14 +170,16 @@ let resolveProjectWith (ct: CancellationToken) (failNote: string) (projectFile: 
     // The host's copy is what will run, so compile against it too. Shared-framework assemblies, System.*
     // and FSharp.Core are already FSI's default references; app-local ones (e.g. FCS itself) are not.
     let frameworkDir = Path.TrimEndingDirectorySeparator(RuntimeEnvironment.GetRuntimeDirectory())
-    let hostCopies =
+    // (the project's copy, the host's copy) of each app-local assembly the host shadows.
+    let hostShadowed =
         shadowed
-        |> List.map (fun p -> hostAssemblies[Path.GetFileNameWithoutExtension p])
-        |> List.filter (fun h ->
+        |> List.map (fun p -> p, hostAssemblies[Path.GetFileNameWithoutExtension p])
+        |> List.filter (fun (_, h) ->
             let name = Path.GetFileName h
             not (h.StartsWith frameworkDir)
             && not (name.Equals("FSharp.Core.dll", StringComparison.OrdinalIgnoreCase))
             && not (name.StartsWith("System.", StringComparison.OrdinalIgnoreCase)))
+    let hostCopies = hostShadowed |> List.map snd
 
     let frameworks =
         refPaths |> List.map (fun i -> str i "FrameworkReferenceName") |> List.filter ((<>) "") |> List.distinct
@@ -222,6 +227,7 @@ let resolveProjectWith (ct: CancellationToken) (failNote: string) (projectFile: 
         { ProjectFile = projectFile
           TargetPath = targetPath
           Managed = own @ keep @ hostCopies @ aspnet
+          EditorRefs = own @ keep @ (hostShadowed |> List.map fst) @ aspnet
           Built = set (own @ builtRefs) |> Set.filter (fun p -> List.contains p keep || List.contains p own)
           Native = native
           Notes = List.ofSeq notes }

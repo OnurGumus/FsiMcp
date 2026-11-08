@@ -237,7 +237,7 @@ type private Front(log: TextWriter) =
         | Error e -> plain (e, true) // keep the current session alive
         | Ok r ->
             let resolveSecs = sw.Elapsed.TotalSeconds
-            let stableRefs = r.Managed // before the snapshot swap: these paths outlive the next load
+            let stableRefs = r.EditorRefs // not snapshot copies: these paths outlive the next load
             let dir, copies = Snapshot.create r.Built
             let swap p = Map.tryFind p copies |> Option.defaultValue p
             loaded <- Some { r with Managed = r.Managed |> List.map swap }
@@ -388,7 +388,7 @@ let private toolsJson =
         "prelude": { "type": "string", "description": "An .fsx script to #load into every new session (after this load, reset and timeout restarts), with its module and top-level opens opened; \"\" removes it. Remembered until changed" },
         "gc_server": { "type": "boolean", "description": "Run the session with Server GC (like ASP.NET apps) instead of workstation GC; matters for timing. Remembered until changed" },
         "artifacts_path": { "type": "string", "description": "Directory for build output (bin, obj); nothing is written under the project. A relative path resolves against the server's working folder. Remembered until changed; \"\" clears it" },
-        "return_references": { "type": "boolean", "description": "Also return the resolved reference paths and target path as structured content" },
+        "return_references": { "type": "boolean", "description": "Also return the reference paths (for an editor: the project's own build and package files) and target path as structured content" },
         "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Environment variables for the session process. Remembered until changed" } },
       "required": ["path"] } },
   { "name": "check_project",
