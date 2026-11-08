@@ -80,7 +80,10 @@ then type-checks the sources with `FSharpChecker` in the server process.
   names its output: `ReferencePath`'s `ReferenceAssembly` (under `obj/.../ref/`) when one is produced, else
   its implementation assembly. A multi-targeted reference is run for the target framework the referencing
   project picked (`SetTargetFramework`). A referenced project whose design-time run fails is read from its
-  last build when that output exists; otherwise the check fails with that project's error.
+  last build when that output exists (the result then says so in a `note:` line); otherwise the check
+  fails with that project's error. A referenced F# project that provides a generative type provider, or
+  an assembly FCS can't supply from memory, is read from its built dll, which `check_project` doesn't
+  build: build it once yourself.
   The checker keeps up to 20 projects' check state (FCS's default is 3), so a repeat check of a
   larger solution re-checks only what changed.
 - `overlays` replace the contents of files for this check only, so an agent can test an edit before saving

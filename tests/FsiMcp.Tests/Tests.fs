@@ -649,6 +649,20 @@ let ``check_project: a broken referenced project doesn't stop the check`` () =
     Assert.Empty(errors r) // AppWithRef uses SampleLib.Lib.version, still declared; SampleLib's error is not ours
 
 [<Fact>]
+let ``check_project: a referenced project that can't be read from source falls back to its last build, with a note`` () =
+    let root = copyFixtures [ "SampleLib"; "AppWithRef" ]
+    let lib = Path.Combine(root, "SampleLib")
+    let artifacts = Path.Combine(root, "artifacts")
+    use s = start ()
+    s.Call("load_project", {| path = lib; artifacts_path = artifacts |}) |> ok |> ignore // builds SampleLib
+    let proj = Path.Combine(lib, "SampleLib.fsproj")
+    // fails only in a design-time run, which sets SkipCompilerExecution
+    File.WriteAllText(proj, File.ReadAllText(proj).Replace("</Project>", """<Target Name="Boom" BeforeTargets="CoreCompile" Condition="'$(SkipCompilerExecution)' == 'true'"><Error Text="boom" /></Target></Project>"""))
+    let r = checkOn s (Path.Combine(root, "AppWithRef")) [||] |> ok
+    Assert.Empty(errors r)
+    Assert.Contains("note: SampleLib.fsproj couldn't be read from source; its last build was used.", r.Text)
+
+[<Fact>]
 let ``check_project: a referenced project's disk edit is seen without a build`` () =
     let root = copyFixtures [ "SampleLib"; "AppWithRef" ]
     let app = Path.Combine(root, "AppWithRef")

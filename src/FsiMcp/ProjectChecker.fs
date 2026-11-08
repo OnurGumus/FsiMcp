@@ -228,10 +228,12 @@ type Checker() =
     let sameFile (a: string) (b: string) = pathComparer.Equals(real (Path.GetFullPath a), real (Path.GetFullPath b))
 
     /// Options built during the current Check, per (project file, configuration, artifacts path, target
-    /// framework): a project
-    /// reached twice (a diamond) gets the same options. Cleared at the start of every Check; the arguments
-    /// behind them come from argsCache, so its stamps invalidate them.
+    /// framework): a project reached twice (a diamond) gets the same options. Cleared at the start of
+    /// every Check; the arguments behind them come from argsCache, so its stamps invalidate them.
     let optionsMemo = Dictionary<string * string * string option * string option, Result<FSharpProjectOptions, string>>()
+
+    /// Notes for the current Check's result (a referenced project read from its last build); cleared with optionsMemo.
+    let notes = ResizeArray<string>()
 
     /// The -r: paths in a project's arguments whose files do not exist, leaving out F# project references
     /// (checked from source, they need no output on disk).
@@ -302,7 +304,11 @@ type Checker() =
                             | Some output ->
                                 match optionsFor r.ProjectFile configuration artifactsPath r.TargetFramework ct with
                                 | Ok o -> attach (FSharpReferencedProject.FSharpReference(output, o) :: acc) rest
-                                | Error _ when File.Exists output -> attach acc rest // FCS reads its last build
+                                | Error _ when File.Exists output ->
+                                    // FCS reads its last build
+                                    let note = $"{Path.GetFileName r.ProjectFile} couldn't be read from source; its last build was used."
+                                    if not (notes.Contains note) then notes.Add note
+                                    attach acc rest
                                 | Error e -> Error $"The referenced project {r.ProjectFile} could not be checked:\n{e}"
                     attach [] (args.ProjectRefs |> List.filter isFSharp)
                     |> Result.map (fun refs ->
@@ -334,6 +340,9 @@ type Checker() =
             | _ -> ()
             versions[f] <- version
 
+    /// Notes about the last Check (a referenced project read from its last build).
+    member _.Notes : string list = List.ofSeq notes
+
     /// Raises OperationCanceledException when `ct` fires (any MSBuild run it started is killed).
     member _.Check(projectFile: string, configuration: string, artifactsPath: string option, overlayList: (string * string) list, ct: CancellationToken) : Result<Diagnostic list, string> =
         if overlayList |> List.exists (fun (p, _) -> String.IsNullOrWhiteSpace p) then Error "Every overlay needs a path." else
@@ -346,6 +355,7 @@ type Checker() =
             if not (ov.ContainsKey(real full)) then order.Add full
             ov[real full] <- content
         optionsMemo.Clear()
+        notes.Clear()
         match optionsFor projectFile configuration artifactsPath None ct with
         | Error e -> Error e
         | Ok opts ->

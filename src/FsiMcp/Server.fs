@@ -298,7 +298,8 @@ type private Front(log: TextWriter) =
             let lines =
                 [ for d in diags -> $"{d.Path}:{d.Line}:{d.Column} {d.Severity} {d.Code} {oneLine d.Message}" ]
             let errors, warnings = count "error", count "warning"
-            { Text = clip 20000 (String.Join("\n", $"{errors} errors, {warnings} warnings" :: lines))
+            let notes = [ for n in checker.Value.Notes -> $"note: {n}" ]
+            { Text = clip 20000 (String.Join("\n", $"{errors} errors, {warnings} warnings" :: notes @ lines))
               IsError = false
               Structured = Some(box {| diagnostics = Array.ofList diags |}) }
 
@@ -396,7 +397,7 @@ let private toolsJson =
         "project": { "type": "string", "description": "Project file, or a directory containing exactly one project" },
         "configuration": { "type": "string", "description": "Build configuration (default Debug)" },
         "artifacts_path": { "type": "string", "description": "Directory for MSBuild output (obj); a relative path resolves against the server's working folder. Default: the one remembered from load_project; \"\" = none" },
-        "overlays": { "type": "array", "description": "Files whose contents to replace for this check; a path that is not one of the project's source files is added as its last source file",
+        "overlays": { "type": "array", "description": "Files whose contents to replace for this check, in the project or a referenced F# project; a path that is no project's source file is added as the checked project's last source file",
           "items": { "type": "object", "properties": {
               "path": { "type": "string", "description": "File path, absolute or relative to the project folder" },
               "content": { "type": "string", "description": "The file's full contents" } },
