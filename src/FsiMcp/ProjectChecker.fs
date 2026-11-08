@@ -52,8 +52,17 @@ let private realPath (cache: Collections.Concurrent.ConcurrentDictionary<string,
     | null -> path
     | d -> Path.Combine(realDir 0 d, Path.GetFileName path)
 
-/// A project the checked project references, and the assembly its build produces.
-type private ProjectRef = { ProjectFile: string; Assembly: string }
+/// A project the checked project references (a ReferencePath item from a project reference).
+type private ProjectRef =
+    { ProjectFile: string
+      /// The implementation assembly (Identity): its time says whether the build is current.
+      Assembly: string
+      /// What the parent's -r: argument names: the reference assembly (ReferenceAssembly metadata, under
+      /// obj/.../ref/) when one is produced, else the implementation assembly.
+      Output: string
+      /// The target framework the parent picked from a multi-targeted project (SetTargetFramework); its
+      /// own design-time run needs it, the outer build of a multi-targeted project has no compile targets.
+      TargetFramework: string option }
 
 /// An F# project reference is checked from its sources; any other is read from its build output.
 let private isFSharp (r: ProjectRef) = r.ProjectFile.EndsWith(".fsproj", StringComparison.OrdinalIgnoreCase)
@@ -66,14 +75,20 @@ type private Args = { CommandLine: string[]; ProjectRefs: ProjectRef list }
 /// ReferencePath items from project references carry the referenced project file; their Identity is the
 /// implementation assembly (the -r: argument is often the reference assembly, which a build rewrites only
 /// when the public surface changes, so its time says nothing about whether the build is current).
-let private commandLineArgs (projectFile: string) (configuration: string) (artifactsPath: string option) (ct: CancellationToken) =
+/// With a target framework (one of a multi-targeted project's), restore gets its own properties without it:
+/// a restore that sees TargetFramework would restore that framework alone.
+let private commandLineArgs (projectFile: string) (configuration: string) (artifactsPath: string option) (targetFramework: string option) (ct: CancellationToken) =
     let dir = Path.GetDirectoryName projectFile
+    let artifacts = artifactsPath |> Option.map (fun p -> $"ArtifactsPath={p}") |> Option.toList
     let args =
         [ "msbuild"; projectFile; "-restore"
           "-t:ResolveAssemblyReferencesDesignTime;ResolveProjectReferencesDesignTime;ResolvePackageDependenciesDesignTime;FindReferenceAssembliesForReferences;CoreCompile"
           $"-p:Configuration={configuration}"; "-p:ProvideCommandLineArgs=true"; "-p:SkipCompilerExecution=true"
           "-p:DesignTimeBuild=true"; "-p:NonExistentFile=__fsimcp_never__" ]
-        @ (artifactsPath |> Option.map (fun p -> $"-p:ArtifactsPath={p}") |> Option.toList)
+        @ (artifacts |> List.map (fun a -> "-p:" + a))
+        @ (match targetFramework with
+           | Some tf -> $"-p:TargetFramework={tf}" :: $"-rp:Configuration={configuration}" :: (artifacts |> List.map (fun a -> "-rp:" + a))
+           | None -> [])
         @ [ "-nologo"; "-getItem:FscCommandLineArgs"; "-getItem:ReferencePath" ]
     let code, out, err = runProcessCancellable "dotnet" args dir ct
     let jsonStart = out.IndexOf('{')
@@ -96,7 +111,17 @@ let private commandLineArgs (projectFile: string) (configuration: string) (artif
                     [ for i in refs.EnumerateArray() do
                         let proj = str i "MSBuildSourceProjectFile"
                         if str i "ReferenceSourceTarget" = "ProjectReference" && proj <> "" then
-                            yield { ProjectFile = Path.GetFullPath proj; Assembly = str i "Identity" } ]
+                            let identity = str i "Identity"
+                            let tf =
+                                (str i "SetTargetFramework").Split(';', StringSplitOptions.RemoveEmptyEntries ||| StringSplitOptions.TrimEntries)
+                                |> Array.tryPick (fun p ->
+                                    let prefix = "TargetFramework="
+                                    if p.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) then Some(p.Substring prefix.Length) else None)
+                            yield
+                                { ProjectFile = Path.GetFullPath proj
+                                  Assembly = identity
+                                  Output = match str i "ReferenceAssembly" with "" -> identity | a -> a
+                                  TargetFramework = tf } ]
                     |> List.distinct
                 | _ -> []
             Ok { CommandLine = commandLine; ProjectRefs = projectRefs }
@@ -105,11 +130,12 @@ let private commandLineArgs (projectFile: string) (configuration: string) (artif
 /// Last-write times of the files whose change invalidates the arguments: the project file, and any
 /// Directory.Build.props/.targets or Directory.Packages.props in its folder or above (missing ones too,
 /// so adding one counts as a change).
-let private argsStamp (projectFile: string) =
+let private stampFiles (projectFile: string) =
     let names = [ "Directory.Build.props"; "Directory.Build.targets"; "Directory.Packages.props" ]
     let rec up (d: DirectoryInfo) = if isNull d then [] else d.FullName :: up d.Parent
     projectFile :: [ for d in up (DirectoryInfo(Path.GetDirectoryName projectFile)) do for n in names -> Path.Combine(d, n) ]
-    |> List.map File.GetLastWriteTimeUtc
+
+let private argsStamp (projectFile: string) = stampFiles projectFile |> List.map File.GetLastWriteTimeUtc
 
 let private hash (s: string) = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes s))
 
@@ -161,7 +187,8 @@ type Checker() =
             projectCacheSize = 20
         )
 
-    let argsCache = Dictionary<string * string * string option, DateTime list * Args>()
+    /// Per (project file, configuration, artifacts path, target framework).
+    let argsCache = Dictionary<string * string * string option * string option, DateTime list * Args>()
 
     /// Per referenced project: the newest source time a rebuild was last tried for. A source that a build
     /// does not compile (a stray .fs, or a reference that fails to build) then costs one build, not one
@@ -172,30 +199,48 @@ type Checker() =
     /// document source FCS learns of changed contents only through NotifyFileChanged.
     let seen = Dictionary<string, Dictionary<string, string>>()
 
-    let getArgs (projectFile: string) configuration artifactsPath (refresh: bool) (ct: CancellationToken) =
-        let key = projectFile, configuration, artifactsPath
-        let stamp = argsStamp projectFile
+    /// The times of the referenced projects' stampFiles, and their references' (those whose arguments are
+    /// cached), in a fixed order: a referenced project file's edit (a package, a project reference) changes
+    /// the parent's arguments too.
+    let refsStamp configuration artifactsPath (refs: ProjectRef list) =
+        let visited = HashSet<string>(pathComparer)
+        let rec walk (refs: ProjectRef list) =
+            [ for r in refs do
+                if visited.Add r.ProjectFile then
+                    yield! stampFiles r.ProjectFile
+                    match argsCache.TryGetValue((r.ProjectFile, configuration, artifactsPath, r.TargetFramework)) with
+                    | true, (_, args) -> yield! walk args.ProjectRefs
+                    | _ -> () ]
+        walk refs |> List.distinct |> List.sort |> List.map File.GetLastWriteTimeUtc
+
+    let getArgs (projectFile: string) configuration artifactsPath targetFramework (refresh: bool) (ct: CancellationToken) =
+        let key = projectFile, configuration, artifactsPath, targetFramework
+        let own = argsStamp projectFile
         match argsCache.TryGetValue key with
-        | true, (s, args) when not refresh && s = stamp -> Ok args
+        | true, (s, args) when not refresh && s = own @ refsStamp configuration artifactsPath args.ProjectRefs -> Ok args
         | _ ->
-            commandLineArgs projectFile configuration artifactsPath ct
+            commandLineArgs projectFile configuration artifactsPath targetFramework ct
             |> Result.map (fun args ->
-                argsCache[key] <- (stamp, args)
+                argsCache[key] <- (own @ refsStamp configuration artifactsPath args.ProjectRefs, args)
                 args)
 
-    /// Options built during the current Check, per (project file, configuration, artifacts path): a project
+    /// Whether two paths name the same file (symbolic links among the folders resolved).
+    let sameFile (a: string) (b: string) = pathComparer.Equals(real (Path.GetFullPath a), real (Path.GetFullPath b))
+
+    /// Options built during the current Check, per (project file, configuration, artifacts path, target
+    /// framework): a project
     /// reached twice (a diamond) gets the same options. Cleared at the start of every Check; the arguments
     /// behind them come from argsCache, so its stamps invalidate them.
-    let optionsMemo = Dictionary<string * string * string option, Result<FSharpProjectOptions, string>>()
+    let optionsMemo = Dictionary<string * string * string option * string option, Result<FSharpProjectOptions, string>>()
 
     /// The -r: paths in a project's arguments whose files do not exist, leaving out F# project references
     /// (checked from source, they need no output on disk).
     let missingRefs (args: Args) =
-        let fsharpNames = args.ProjectRefs |> List.filter isFSharp |> List.map (fun r -> Path.GetFileName r.Assembly)
+        let fsharpOutputs = args.ProjectRefs |> List.filter isFSharp |> List.map (fun r -> r.Output)
         args.CommandLine
         |> Array.filter (fun a -> a.StartsWith "-r:")
         |> Array.map (fun a -> a.Substring 3)
-        |> Array.filter (fun r -> not (File.Exists r) && not (fsharpNames |> List.exists (fun n -> pathComparer.Equals(n, Path.GetFileName r))))
+        |> Array.filter (fun r -> not (File.Exists r) && not (fsharpOutputs |> List.exists (sameFile r)))
 
     /// Non-F# referenced projects whose output is missing, or whose sources are newer than their assembly
     /// (not yet retried for that time), with that newest source time.
@@ -209,8 +254,8 @@ type Checker() =
 
     /// A project's arguments, with every non-F# referenced project built once if its output is missing or
     /// stale. F# references are never built.
-    let argsFor (projectFile: string) configuration artifactsPath (ct: CancellationToken) =
-        getArgs projectFile configuration artifactsPath false ct
+    let argsFor (projectFile: string) configuration artifactsPath targetFramework (ct: CancellationToken) =
+        getArgs projectFile configuration artifactsPath targetFramework false ct
         |> Result.bind (fun args ->
             let stale = toBuild args artifactsPath
             if missingRefs args |> Array.isEmpty && List.isEmpty stale then Ok args
@@ -218,11 +263,13 @@ type Checker() =
                 // Build just those references (each brings its own references with it), then ask again.
                 let failures =
                     [ for p, newest in stale do
+                        let built = resolveProjectWith ct "" p true configuration artifactsPath
+                        // Only a build that ran to the end counts as tried (a cancelled one raised above).
                         rebuiltFor[p] <- newest
-                        match resolveProjectWith ct "" p true configuration artifactsPath with
+                        match built with
                         | Error e -> yield e
                         | Ok _ -> () ]
-                getArgs projectFile configuration artifactsPath true ct
+                getArgs projectFile configuration artifactsPath targetFramework true ct
                 |> Result.bind (fun args ->
                     match missingRefs args with
                     | [||] -> Ok args
@@ -233,13 +280,15 @@ type Checker() =
     /// FCS options for one project, its F# references attached as FSharpReference (checked from their
     /// sources) recursively. The source files are split off the flags: GetProjectOptionsFromCommandLineArgs
     /// leaves SourceFiles empty and keeps them in OtherOptions, checked after SourceFiles.
-    let rec optionsFor (projectFile: string) (configuration: string) (artifactsPath: string option) (ct: CancellationToken) : Result<FSharpProjectOptions, string> =
-        let key = projectFile, configuration, artifactsPath
+    let rec optionsFor (projectFile: string) (configuration: string) (artifactsPath: string option) (targetFramework: string option) (ct: CancellationToken) : Result<FSharpProjectOptions, string> =
+        let key = projectFile, configuration, artifactsPath, targetFramework
         match optionsMemo.TryGetValue key with
         | true, r -> r
         | _ ->
+            // In progress: a reference cycle back to this project gets an error, not endless recursion.
+            optionsMemo[key] <- Error $"Project references form a cycle through {projectFile}."
             let result =
-                argsFor projectFile configuration artifactsPath ct
+                argsFor projectFile configuration artifactsPath targetFramework ct
                 |> Result.bind (fun args ->
                     let flags, sourceFiles = args.CommandLine |> Array.partition (fun a -> a.StartsWith "-")
                     let refPaths = flags |> Array.filter (fun a -> a.StartsWith "-r:") |> Array.map (fun a -> a.Substring 3)
@@ -247,14 +296,14 @@ type Checker() =
                         match refs with
                         | [] -> Ok(List.rev acc)
                         | (r: ProjectRef) :: rest ->
-                            // FCS pairs a referenced project with the -r: argument naming its output: the
-                            // reference assembly (obj/.../ref/) when one is produced, not ReferencePath's Identity.
-                            match refPaths |> Array.tryFind (fun p -> pathComparer.Equals(Path.GetFileName p, Path.GetFileName r.Assembly)) with
+                            // FCS pairs a referenced project with the -r: argument naming its output.
+                            match refPaths |> Array.tryFind (sameFile r.Output) with
                             | None -> attach acc rest
                             | Some output ->
-                                match optionsFor r.ProjectFile configuration artifactsPath ct with
-                                | Error e -> Error e
+                                match optionsFor r.ProjectFile configuration artifactsPath r.TargetFramework ct with
                                 | Ok o -> attach (FSharpReferencedProject.FSharpReference(output, o) :: acc) rest
+                                | Error _ when File.Exists output -> attach acc rest // FCS reads its last build
+                                | Error e -> Error $"The referenced project {r.ProjectFile} could not be checked:\n{e}"
                     attach [] (args.ProjectRefs |> List.filter isFSharp)
                     |> Result.map (fun refs ->
                         let opts = checker.GetProjectOptionsFromCommandLineArgs(projectFile, flags)
@@ -297,7 +346,7 @@ type Checker() =
             if not (ov.ContainsKey(real full)) then order.Add full
             ov[real full] <- content
         optionsMemo.Clear()
-        match optionsFor projectFile configuration artifactsPath ct with
+        match optionsFor projectFile configuration artifactsPath None ct with
         | Error e -> Error e
         | Ok opts ->
             // Every options set in the graph: the checked project's and its F# references', each once.

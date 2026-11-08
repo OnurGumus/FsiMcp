@@ -77,14 +77,19 @@ then type-checks the sources with `FSharpChecker` in the server process.
   checked while a project it references does not compile: errors in a referenced project are not reported
   and do not stop the check, and an edit to a referenced project's files is seen on the next check. The
   diagnostics are the checked project's only. FCS pairs a referenced project with the `-r:` argument that
-  names its output (the reference assembly under `obj/.../ref/` when one is produced), found by the assembly's
-  file name. The checker keeps up to 20 projects' check state (FCS's default is 3), so a repeat check of a
+  names its output: `ReferencePath`'s `ReferenceAssembly` (under `obj/.../ref/`) when one is produced, else
+  its implementation assembly. A multi-targeted reference is run for the target framework the referencing
+  project picked (`SetTargetFramework`). A referenced project whose design-time run fails is read from its
+  last build when that output exists; otherwise the check fails with that project's error. The checker keeps up to 20 projects' check state (FCS's default is 3), so a repeat check of a
   larger solution re-checks only what changed.
 - `overlays` replace the contents of files for this check only, so an agent can test an edit before saving
   it. They apply to any file, in the checked project or a referenced F# project. A path that is no project's
   file is added to the checked project, and checked last.
-- The arguments are cached per project, configuration and artifacts path. The cache is refreshed when the
-  project file or `Directory.Build.props`, `Directory.Build.targets` or `Directory.Packages.props` changes.
+- The arguments are cached per project, configuration, artifacts path and target framework. The cache is
+  refreshed when the project file or `Directory.Build.props`, `Directory.Build.targets` or
+  `Directory.Packages.props` changes, for the project or any project it references (directly or further
+  down): a package or project reference added to a referenced project reaches the referencing project's
+  arguments.
 - Other references (C#, VB projects) are read from their build output. One that has never been built, or that
   changed since it was last built, is built first (just that project). The design-time run also returns
   `ReferencePath`; its project-reference items name the referenced project and its output assembly. A

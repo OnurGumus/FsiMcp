@@ -715,6 +715,72 @@ let ``check_project: a C# reference still builds`` () =
     Assert.Empty(errors r)
 
 [<Fact>]
+let ``check_project: a multi-targeted F# reference is checked from source`` () =
+    let root = copyFixtures [ "MultiLib"; "AppWithMulti" ]
+    let app = Path.Combine(root, "AppWithMulti")
+    use s = start ()
+    Assert.Empty(errors (checkOn s app [||] |> ok))
+    let lib = Path.Combine(root, "MultiLib", "M.fs")
+    let r =
+        checkOn s app
+            [| {| path = lib; content = File.ReadAllText lib + "\nlet viaOverlay = 4\n" |}
+               {| path = "Program.fs"; content = "module AppWithMulti.Program\nlet x = MultiLib.M.viaOverlay\n" |} |]
+        |> ok
+    Assert.Empty(errors r)
+    notBuilt root "MultiLib"
+
+/// A path with the symbolic links among its folders resolved (macOS's /var is /private/var).
+let rec realDir (d: string) : string =
+    match Path.GetDirectoryName d with
+    | null -> d
+    | parent ->
+        let candidate = Path.Combine(realDir parent, Path.GetFileName d)
+        match DirectoryInfo(candidate).LinkTarget with
+        | null -> candidate
+        | target -> realDir (Path.GetFullPath(target, Path.GetDirectoryName candidate))
+
+[<Fact>]
+let ``check_project: a referenced project file's edit refreshes the arguments`` () =
+    // On the real path: NuGet's no-op check misses a referenced project's change when the project is named
+    // through a symbolic link (the temp folder on macOS), so the restore would not bring the package.
+    let root = realDir (copyFixtures [ "LibA"; "LibB"; "Chain" ])
+    let chain = Path.Combine(root, "Chain")
+    use s = start ()
+    Assert.Empty(errors (checkOn s chain [||] |> ok))
+    // LibB takes a package, which reaches Chain's references transitively: only Chain's own arguments carry it
+    let proj = Path.Combine(root, "LibB", "LibB.fsproj")
+    File.WriteAllText(proj, File.ReadAllText(proj).Replace("""<ProjectReference Include="../LibA/LibA.fsproj" />""", """<ProjectReference Include="../LibA/LibA.fsproj" /><PackageReference Include="Newtonsoft.Json" Version="13.0.3" />"""))
+    let r = checkOn s chain [| {| path = "Program.fs"; content = "module Chain.Program\nlet s = Newtonsoft.Json.JsonConvert.SerializeObject LibB.B.b\n" |} |] |> ok
+    Assert.Empty(errors r)
+
+[<Fact>]
+let ``check_project: a check cancelled while it builds a C# reference doesn't stop the next one building it`` () =
+    let root = copyFixtures [ "CsLib"; "AppWithCs" ]
+    let cs = Path.Combine(root, "CsLib")
+    // CsLib's build (never its design-time evaluation) says it started, then takes a minute while `slow` exists.
+    File.WriteAllText(Path.Combine(cs, "slow"), "")
+    File.WriteAllText(
+        Path.Combine(cs, "Directory.Build.targets"),
+        """<Project>
+  <Target Name="FsiMcpTestSlow" BeforeTargets="CoreCompile" Condition="'$(DesignTimeBuild)' != 'true' and Exists('$(MSBuildThisFileDirectory)slow')">
+    <Touch Files="$(MSBuildThisFileDirectory)building" AlwaysCreate="true" />
+    <Exec Condition="'$(OS)' != 'Windows_NT'" Command="sleep 60" />
+    <Exec Condition="'$(OS)' == 'Windows_NT'" Command="powershell -NoProfile -Command Start-Sleep 60" />
+  </Target>
+</Project>""")
+    use s = start ()
+    let app = Path.Combine(root, "AppWithCs")
+    let id = s.Send("tools/call", {| name = "check_project"; arguments = {| project = app; artifacts_path = Path.Combine(root, "artifacts") |} |})
+    let sw = Diagnostics.Stopwatch.StartNew()
+    while not (File.Exists(Path.Combine(cs, "building"))) && sw.Elapsed < TimeSpan.FromSeconds 120. do
+        Threading.Thread.Sleep 200
+    Assert.True(File.Exists(Path.Combine(cs, "building")), "CsLib's build never started")
+    s.Notify("notifications/cancelled", {| requestId = id; reason = "budget ran out" |})
+    Server.ToToolResult(s.Await(id, "check_project")) |> failed |> has "cancelled"
+    File.Delete(Path.Combine(cs, "slow"))
+    Assert.Empty(errors (checkOn s app [||] |> ok))
+
+[<Fact>]
 let ``a cancelled check_project does not hold up later calls`` () =
     let dir = copyFixture "SampleLib"
     // Make check_project's MSBuild run take a minute.
