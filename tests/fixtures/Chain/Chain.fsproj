@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Test fixture: references LibA and LibB, so LibA is reached directly and through LibB. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../LibA/LibA.fsproj" />
+    <ProjectReference Include="../LibB/LibB.fsproj" />
+  </ItemGroup>
+
+</Project>

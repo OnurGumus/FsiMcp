@@ -584,12 +584,22 @@ let ``check_project works on an up-to-date project`` () =
     let r = checkOn s dir [| {| path = "Library.fs"; content = badLibrary |} |] |> ok
     Assert.Equal<(string * int * string) list>([ "Library.fs", 2, "FS0001" ], errors r |> List.map where)
 
+/// Nothing was built for a project: no assembly of it under the artifacts path (a design-time run creates
+/// the empty output folders), and no bin/ or obj/ in its folder.
+let notBuilt (root: string) (name: string) =
+    let artifacts = Path.Combine(root, "artifacts")
+    let built = if Directory.Exists artifacts then Directory.GetFiles(artifacts, name + ".dll", SearchOption.AllDirectories) else [||]
+    Assert.True(Array.isEmpty built, $"{name} was built: {String.Join(' ', built)}")
+    Assert.False(Directory.Exists(Path.Combine(root, name, "bin")), $"bin/ under {name}")
+    Assert.False(Directory.Exists(Path.Combine(root, name, "obj")), $"obj/ under {name}")
+
 [<Fact>]
 let ``check_project checks a project whose reference was never built`` () =
     let root = copyFixtures [ "SampleLib"; "AppWithRef" ]
     use s = start ()
     let r = checkOn s (Path.Combine(root, "AppWithRef")) [||] |> ok
     Assert.Empty(errors r)
+    notBuilt root "SampleLib" // checked from source, not built
 
 [<Fact>]
 let ``check_project checks a broken project whose reference was never built`` () =
@@ -631,13 +641,77 @@ let ``check_project uses the artifacts path remembered from load_project`` () =
     Assert.False(Directory.Exists(Path.Combine(dir, "bin")), "bin/ under the project")
 
 [<Fact>]
-let ``check_project rebuilds a referenced project changed since its last build`` () =
+let ``check_project: a broken referenced project doesn't stop the check`` () =
+    let root = copyFixtures [ "SampleLib"; "AppWithRef" ]
+    File.AppendAllText(Path.Combine(root, "SampleLib", "Library.fs"), "\nlet broken : int = \"x\"\n")
+    use s = start ()
+    let r = checkOn s (Path.Combine(root, "AppWithRef")) [||] |> ok
+    Assert.Empty(errors r) // AppWithRef uses SampleLib.Lib.version, still declared; SampleLib's error is not ours
+
+[<Fact>]
+let ``check_project: a referenced project's disk edit is seen without a build`` () =
     let root = copyFixtures [ "SampleLib"; "AppWithRef" ]
     let app = Path.Combine(root, "AppWithRef")
     use s = start ()
     Assert.Empty(errors (checkOn s app [||] |> ok))
     File.AppendAllText(Path.Combine(root, "SampleLib", "Library.fs"), "\nlet added = 1\n")
     let r = checkOn s app [| {| path = "Program.fs"; content = "module AppWithRef.Program\nlet doubled = SampleLib.Lib.added * 2\n" |} |] |> ok
+    Assert.Empty(errors r)
+    notBuilt root "SampleLib"
+
+[<Fact>]
+let ``check_project: an overlay in a referenced project is used`` () =
+    let root = copyFixtures [ "SampleLib"; "AppWithRef" ]
+    let lib = Path.Combine(root, "SampleLib", "Library.fs")
+    use s = start ()
+    let r =
+        checkOn s (Path.Combine(root, "AppWithRef"))
+            [| {| path = lib; content = File.ReadAllText lib + "\nlet viaOverlay = 2\n" |}
+               {| path = "Program.fs"; content = "module AppWithRef.Program\nlet doubled = SampleLib.Lib.viaOverlay * 2\n" |} |]
+        |> ok
+    Assert.Empty(errors r)
+
+[<Fact>]
+let ``check_project: an overlay in a referenced project is used after an earlier check`` () =
+    // Notifying the checked project of its own overlay makes FCS re-check the referenced project right
+    // then; it must already see the overlays.
+    let root = copyFixtures [ "SampleLib"; "AppWithRef" ]
+    let lib = Path.Combine(root, "SampleLib", "Library.fs")
+    let app = Path.Combine(root, "AppWithRef")
+    use s = start ()
+    Assert.Empty(errors (checkOn s app [||] |> ok))
+    let r =
+        checkOn s app
+            [| {| path = lib; content = File.ReadAllText lib + "\nlet viaOverlay = 2\n" |}
+               {| path = "Program.fs"; content = "module AppWithRef.Program\nlet doubled = SampleLib.Lib.viaOverlay * 2\n" |} |]
+        |> ok
+    Assert.Empty(errors r)
+
+[<Fact>]
+let ``check_project: references are checked from source recursively, through a diamond`` () =
+    let root = copyFixtures [ "LibA"; "LibB"; "Chain" ]
+    let chain = Path.Combine(root, "Chain")
+    use s = start ()
+    Assert.Empty(errors (checkOn s chain [||] |> ok))
+    for name in [ "LibA"; "LibB" ] do notBuilt root name
+    // LibA's new type reaches Chain from source, directly and through LibB. (LibB's own `a + 1` would not
+    // do: with a string `a` it is an error whose recovery leaves `b` a string, and Chain's `b + a` compiles.)
+    let r =
+        checkOn s chain
+            [| {| path = Path.Combine(root, "LibA", "A.fs"); content = "module LibA.A\nlet a = \"s\"\n" |}
+               {| path = Path.Combine(root, "LibB", "B.fs"); content = "module LibB.B\nlet b = LibA.A.a\n" |}
+               {| path = "Program.fs"; content = "module Chain.Program\nlet viaB : int = LibB.B.b\nlet direct : int = LibA.A.a\n" |} |]
+        |> ok
+    Assert.Equal<(string * int * string) list>([ "Program.fs", 2, "FS0001"; "Program.fs", 3, "FS0001" ], errors r |> List.map where)
+    // and LibB's error (b is a string, LibB's error is its own) is not reported: only the checked project's diagnostics
+    let r = checkOn s chain [| {| path = Path.Combine(root, "LibA", "A.fs"); content = "module LibA.A\nlet a = \"s\"\n" |} |] |> ok
+    Assert.Empty(errors r)
+
+[<Fact>]
+let ``check_project: a C# reference still builds`` () =
+    let root = copyFixtures [ "CsLib"; "AppWithCs" ]
+    use s = start ()
+    let r = checkOn s (Path.Combine(root, "AppWithCs")) [||] |> ok
     Assert.Empty(errors r)
 
 [<Fact>]

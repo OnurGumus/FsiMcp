@@ -66,21 +66,33 @@ A failed build returns only the compiler errors and keeps the current session ru
 ## Checking a project
 
 `check_project` type-checks a project without touching the F# Interactive session, and without building it
-except when a referenced project needs it (below). It asks MSBuild for the compiler arguments with a design-time run (`ResolveAssemblyReferencesDesignTime`,
+except when a non-F# referenced project needs it (below). It asks MSBuild for the compiler arguments with a design-time run (`ResolveAssemblyReferencesDesignTime`,
 `ResolveProjectReferencesDesignTime`, `ResolvePackageDependenciesDesignTime`,
 `FindReferenceAssembliesForReferences`, `CoreCompile` with `ProvideCommandLineArgs` and `SkipCompilerExecution`),
 then type-checks the sources with `FSharpChecker` in the server process.
 
+- Referenced F# projects are checked from their sources, as an editor (Ionide) does: each gets its own
+  design-time run, and is attached to the project that references it as an `FSharpReference`, recursively
+  (a project reached twice, as in a diamond, is checked once). They are never built, so a project can be
+  checked while a project it references does not compile: errors in a referenced project are not reported
+  and do not stop the check, and an edit to a referenced project's files is seen on the next check. The
+  diagnostics are the checked project's only. FCS pairs a referenced project with the `-r:` argument that
+  names its output (the reference assembly under `obj/.../ref/` when one is produced), found by the assembly's
+  file name. The checker keeps up to 20 projects' check state (FCS's default is 3), so a repeat check of a
+  larger solution re-checks only what changed.
 - `overlays` replace the contents of files for this check only, so an agent can test an edit before saving
-  it. A path that is not one of the project's files is added, and checked last.
+  it. They apply to any file, in the checked project or a referenced F# project. A path that is no project's
+  file is added to the checked project, and checked last.
 - The arguments are cached per project, configuration and artifacts path. The cache is refreshed when the
   project file or `Directory.Build.props`, `Directory.Build.targets` or `Directory.Packages.props` changes.
-- A referenced project that has never been built, or that changed since it was last built, triggers one
-  build first. The design-time run also returns `ReferencePath`; its project-reference items name the
-  referenced project and its output assembly. A reference is stale when a `.fs`, `.fsi` or `.fsproj` file
-  under its folder (skipping `bin/`, `obj/`, hidden folders, the artifacts path and nested projects' folders)
-  is newer than that assembly. The build is the same one `load_project` runs; it is tried once per change,
-  so a reference that fails to build is checked as last built rather than rebuilt on every check.
+- Other references (C#, VB projects) are read from their build output. One that has never been built, or that
+  changed since it was last built, is built first (just that project). The design-time run also returns
+  `ReferencePath`; its project-reference items name the referenced project and its output assembly. A
+  reference is stale when a source or project file (`.cs`, `.csproj`, `.vb`, `.vbproj`, `.fs`, `.fsi`,
+  `.fsproj`) under its folder (skipping `bin/`, `obj/`, hidden folders, the artifacts path and nested
+  projects' folders) is newer than that assembly. The build is the same one `load_project` runs; it is tried
+  once per change, so a reference that fails to build is checked as last built rather than rebuilt on every
+  check.
 - Without `artifacts_path`, the one remembered from `load_project` is used.
 - A client that gives up sends `notifications/cancelled`: the check stops (its MSBuild run is killed, or
   the type-check is cancelled) and frees the server for the next call.
