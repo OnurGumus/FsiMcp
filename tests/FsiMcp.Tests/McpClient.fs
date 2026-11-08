@@ -18,7 +18,8 @@ let fixturesDir = metadata "FixturesDir"
 
 type ToolResult = { Text: string; IsError: bool; Structured: JsonElement option }
 
-type Server(?cwd: string) =
+/// `env`: variables set in the server's environment.
+type Server(?cwd: string, ?env: (string * string) list) =
     let stderr = StringBuilder()
     let p =
         let psi = ProcessStartInfo("dotnet")
@@ -30,6 +31,7 @@ type Server(?cwd: string) =
         psi.StandardInputEncoding <- UTF8Encoding(false)
         psi.StandardOutputEncoding <- UTF8Encoding(false)
         psi.WorkingDirectory <- defaultArg cwd Environment.CurrentDirectory
+        for k, v in defaultArg env [] do psi.Environment[k] <- v
         let p = Process.Start psi
         p.ErrorDataReceived.Add(fun e -> if not (isNull e.Data) then lock stderr (fun () -> stderr.AppendLine e.Data |> ignore))
         p.BeginErrorReadLine()

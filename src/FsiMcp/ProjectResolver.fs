@@ -42,6 +42,10 @@ let runProcessCancellable (file: string) (args: string list) (cwd: string) (ct: 
     psi.RedirectStandardError <- true
     psi.Environment["MSBUILDTERMINALLOGGER"] <- "off"
     psi.Environment["DOTNET_CLI_UI_LANGUAGE"] <- "en"
+    // With this set (`dotnet test` sets it, so a server started under a test run inherits it), MSBuild
+    // starts its worker nodes on its own stdout/stderr. A node outlives the run (node reuse), holding
+    // the pipes open, so reading them to the end would wait until the idle node exits.
+    psi.Environment.Remove "MSBUILDENSURESTDOUTFORTASKPROCESSES" |> ignore
     for a in args do psi.ArgumentList.Add a
     use p = Process.Start psi
     p.StandardInput.Close()

@@ -732,7 +732,14 @@ let ``check_project: a C# reference still builds`` () =
 let ``check_project: a multi-targeted F# reference is checked from source`` () =
     let root = copyFixtures [ "MultiLib"; "AppWithMulti" ]
     let app = Path.Combine(root, "AppWithMulti")
-    use s = start ()
+    // Its design-time run starts an MSBuild worker node that outlives the run (node reuse). The server
+    // must not wait for that node, even when its streams are the run's own: `dotnet test` sets
+    // MSBUILDENSURESTDOUTFORTASKPROCESSES, which makes MSBuild start nodes on its stdout/stderr. A fresh
+    // handshake salt keeps an idle node left by another build from being reused instead, so the run
+    // starts a node of its own on every machine (as on a fresh CI runner).
+    use s =
+        (new Server(env = [ "MSBUILDENSURESTDOUTFORTASKPROCESSES", "1"
+                            "MSBUILDNODEHANDSHAKESALT", Guid.NewGuid().ToString("N") ])).Start()
     Assert.Empty(errors (checkOn s app [||] |> ok))
     let lib = Path.Combine(root, "MultiLib", "M.fs")
     let r =
